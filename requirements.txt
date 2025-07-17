@@ -1,0 +1,1 @@
+pip install Flask[async] "pocketoptionapi-async @ git+https://github.com/ChipaDevTeam/PocketOptionAPI.git" gunicorn uvicorn websockets==11.0 selenium webdriver-manager
