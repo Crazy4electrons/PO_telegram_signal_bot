@@ -1,1 +1,1 @@
-42["auth",{"session":"154dbc9dc5760b2fe7d82eb5bc5c25df","isDemo":1,"uid":92118257,"platform":9,"isFastHistory":true,"isOptimized":true}]
+42["auth",{"session":"17ff07c60854debfb039f78bc3cfc44c","isDemo":1,"uid":92118257,"platform":9,"isFastHistory":true}]

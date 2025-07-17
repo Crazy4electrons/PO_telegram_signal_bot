@@ -85,7 +85,7 @@ def get_ssid_from_browser(email, password):
 
                 # --- CRITICAL FINAL CHANGE HERE ---
                 # Add "isOptimized":true to match browser's SSID exactly
-                full_ssid_string = f'42["auth",{{"session":"{extracted_session_id}","isDemo":1,"uid":{HARDCODED_UID},"platform":9,"isFastHistory":true,"isOptimized":true}}]'
+                full_ssid_string = f'42["auth",{{"session":"{extracted_session_id}","isDemo":1,"uid":{HARDCODED_UID},"platform":9,"isFastHistory":true}}]'
                 logger.info(f"Constructed full SSID string: {full_ssid_string}")
                 return full_ssid_string
             else:
