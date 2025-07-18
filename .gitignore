@@ -1,0 +1,6 @@
+shared_data
+browser_profiles
+drivers
+.env
+__pycache__
+ssid.txt

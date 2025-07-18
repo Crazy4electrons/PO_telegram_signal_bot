@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 # --- Configuration ---
 # IMPORTANT: Replace this with your actual Ngrok HTTPS URL
-WEBHOOK_URL = "https://0ff9070c946a.ngrok-free.app/trade_signal" # e.g., "https://abcdef12345.ngrok-free.app/trade_signal"
+WEBHOOK_URL = "http://localhost:5000/trade_signal" # e.g., "https://abcdef12345.ngrok-free.app/trade_signal"
 # --- End Configuration ---
 
 # Base notification template

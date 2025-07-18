@@ -1,4 +1,4 @@
-# scraper.py - Automated Scraper for Pocket Option SSID and UID
+# scraper_debug.py - Highly verbose scraper for debugging Pocket Option authentication
 
 import os
 import json
@@ -6,7 +6,7 @@ import time
 import re
 import logging
 import urllib.parse
-from typing import cast, List, Dict, Any, Optional
+from typing import cast, List, Dict, Any
 
 from selenium import webdriver
 from selenium.webdriver.edge.service import Service
@@ -24,14 +24,20 @@ load_dotenv()
 MANUAL_EDGEDRIVER_PATH = r"C:\Users\IT-SUPPORT-03\Documents\letGo\drivers\msedgedriver.exe"
 # -------------------------------
 
-# Configure logging for this script.
+# Configure logging for this script to provide clear, structured output.
+# Set level to DEBUG to capture all possible information.
 logging.basicConfig(
-    level=logging.INFO, # Changed to INFO for general output
+    level=logging.DEBUG, # <--- Set to DEBUG
     format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "module": "%(name)s", "message": "%(message)s"}',
 )
 logger = logging.getLogger(__name__)
 
 LOCAL_SHARED_DATA_DIR = "./shared_data"
+# SSID_FILE_PATH is not strictly used for reading/writing SSID in this version,
+# as it's primarily handled by .env, but kept for consistency if needed.
+SSID_FILE_PATH = os.path.join(LOCAL_SHARED_DATA_DIR, "ssid.txt") 
+
+HARDCODED_UID = 92118257 # Ensure this is still your actual UID
 
 
 def save_to_env(key: str, value: str):
@@ -48,29 +54,29 @@ def save_to_env(key: str, value: str):
         with open(env_path, "r") as f:
             for line in f:
                 if line.strip().startswith(f"{key}="):
-                    lines.append(f"{key}='{value}'\n") # Use single quotes
+                    lines.append(f"{key}='{value}'\n") # <--- Use single quotes
                     found = True
                 else:
                     lines.append(line)
 
     if not found:
-        lines.append(f"{key}='{value}'\n") # Use single quotes
+        lines.append(f"{key}='{value}'\n") # <--- Use single quotes
 
     with open(env_path, "w") as f:
         f.writelines(lines)
     logger.info(f"Successfully saved {key} to .env file.")
 
 
-def get_pocketoption_session_data(email: str, password: str, account_type: str) -> dict[str, Optional[str]]:
+def get_pocketoption_ssid(email: str, password: str):
     """
     Automates the process of logging into PocketOption using Microsoft Edge,
-    navigating to a specific cabinet page (real or demo), and then scraping
-    WebSocket traffic to extract the session ID (SSID) and User ID (UID).
-    Returns a dictionary containing 'ssid' and 'uid'.
+    navigating to a specific cabinet page, and then scraping WebSocket traffic
+    to extract the session ID (SSID).
     """
-    logger.info(f"Starting Microsoft Edge browser instance for automated login to {account_type} account...")
+    logger.info("Starting Microsoft Edge browser instance for automated login...")
     
     edge_options = EdgeOptions()
+    # No headless mode to allow visual debugging
     edge_options.add_argument("--no-sandbox")
     edge_options.add_argument("--disable-dev-shm-usage")
     edge_options.add_argument("--disable-gpu")
@@ -86,39 +92,19 @@ def get_pocketoption_session_data(email: str, password: str, account_type: str) 
     edge_options.set_capability("ms:loggingPrefs", {"performance": "ALL"})
 
     driver = None
-    session_data = {"ssid": None, "uid": None}
-
     try:
         service = Service(MANUAL_EDGEDRIVER_PATH)
         driver = webdriver.Edge(service=service, options=edge_options)
         logger.info("Microsoft Edge WebDriver initialized successfully.")
 
         login_url = "https://pocketoption.com/en/login/"
+        cabinet_base_url = "https://pocketoption.com/en/cabinet"
+        target_cabinet_url = "https://pocketoption.com/en/cabinet/demo-quick-high-low/"
         
-        # Determine target cabinet URL based on selected account type
-        if account_type.upper() == "DEMO":
-            target_cabinet_url = "https://pocketoption.com/en/cabinet/demo-quick-high-low/"
-            expected_is_demo_value = 1 # Expected isDemo value in SSID for demo account
-        elif account_type.upper() == "REAL":
-            target_cabinet_url = "https://pocketoption.com/en/cabinet/" # General cabinet for real
-            expected_is_demo_value = 0 # Expected isDemo value in SSID for real account
-        else:
-            raise ValueError("Invalid account_type. Must be 'DEMO' or 'REAL'.")
-
-        # Regex to capture the session string (SSID) and the uid from the "auth" message.
-        # It handles escaped quotes within the session string and verifies isDemo.
-        # Group 1: Full "auth" payload (for SSID env var)
-        # Group 2: Session string (raw value for AsyncPocketOptionClient)
-        # Group 3: isDemo value (int)
-        # Group 4: UID value (int)
-        ssid_uid_pattern = re.compile(
-            r'42\["auth",\{"session":"((?:\\.|[^"\\])*)",'  # Group 1: Full session string with escapes
-            r'"isDemo":(\d),'                               # Group 2: isDemo (0 or 1)
-            r'"uid":(\d+),'                                 # Group 3: UID
-            r'"platform":\d+,'
-            r'"isFastHistory":(?:true|false),'
-            r'"isOptimized":(?:true|false)\}\]'
-        )
+        # Regex to capture the exact authentication message you provided.
+        # This is very specific to the structure: 42["auth",{"session":"...","isDemo":0,"uid":92118257,"platform":2,"isFastHistory":true,"isOptimized":true}]
+        # It handles escaped quotes within the session string.
+        ssid_pattern = r'(42\["auth",\{"session":"((?:\\.|[^"\\])*)","isDemo":(?:true|false|\d+),"uid":\d+,"platform":\d+,"isFastHistory":(?:true|false),"isOptimized":(?:true|false)\}\])'
         
         logger.info(f"Navigating to login page: {login_url}")
         driver.get(login_url)
@@ -154,18 +140,16 @@ def get_pocketoption_session_data(email: str, password: str, account_type: str) 
         time.sleep(10) # Increased sleep to ensure more logs are captured
 
         performance_logs = cast(List[Dict[str, Any]], driver.get_log("performance"))
-        logger.info(f"Collected {len(performance_logs)} performance log entries. Analyzing for SSID and UID...")
+        logger.info(f"Collected {len(performance_logs)} performance log entries. Analyzing for SSID...")
 
         found_full_ssid_string = None
-        found_uid = None
-        
         # Iterate through the performance logs to find WebSocket frames.
         for i, entry in enumerate(performance_logs):
             try:
                 message = json.loads(entry["message"])
                 log_method = message["message"]["method"]
                 
-                # Log all WebSocket frame messages in detail (DEBUG level)
+                # Log all WebSocket frame messages in detail
                 if log_method == "Network.webSocketFrameReceived" or log_method == "Network.webSocketFrameSent":
                     payload_data = message["message"]["params"]["response"]["payloadData"]
                     logger.debug(f"--- WebSocket Frame ({log_method}) Entry {i} ---")
@@ -174,29 +158,19 @@ def get_pocketoption_session_data(email: str, password: str, account_type: str) 
                     logger.debug(f"Payload Data: {payload_data}")
                     logger.debug("-----------------------------------")
 
-                    # Attempt to find the full SSID and UID string using the defined regex pattern.
-                    match = ssid_uid_pattern.search(payload_data)
+                    # Attempt to find the full SSID string using the defined regex pattern.
+                    match = re.search(ssid_pattern, payload_data)
                     if match:
-                        extracted_session = match.group(1).replace('\\"', '"') # Unescape quotes
-                        extracted_is_demo = int(match.group(2))
-                        extracted_uid_str = match.group(3)
-                        
-                        if extracted_is_demo == expected_is_demo_value:
-                            # Construct the full string including the 42 prefix and the JSON structure
-                            full_payload_for_env = f'42["auth",{{"session":"{extracted_session.replace("\"", "\\\"")}","isDemo":{extracted_is_demo},"uid":{extracted_uid_str},"platform":2,"isFastHistory":true,"isOptimized":true}}]'
-                            
-                            found_full_ssid_string = full_payload_for_env
-                            found_uid = extracted_uid_str
-                            
-                            logger.info(
-                                f"FOUND SSID and UID IN LOGS FOR {account_type} ACCOUNT."
-                                f"SSID: {found_full_ssid_string[:50]}... UID: {found_uid}"
-                            )
-                            # Do NOT break here. Continue logging other messages to see the full loop.
-                            # We will save the *last* found valid SSID and UID.
-                        else:
-                            logger.warning(f"Found SSID but 'isDemo' ({extracted_is_demo}) did not match expected ({expected_is_demo_value}). Skipping.")
+                        found_full_ssid_string = match.group(1)
+                        logger.info(
+                            f"FOUND SSID IN LOGS: {found_full_ssid_string}"
+                        )
+                        # Do NOT break here. Continue logging other messages to see the full loop.
+                        # We will save the *last* found valid SSID.
 
+                # Optionally log other interesting network events
+                elif "Network" in log_method:
+                    logger.debug(f"Network Event ({log_method}): {message['message'].get('params', {}).get('request', {}).get('url', '')}")
 
             except json.JSONDecodeError:
                 logger.debug(f"Skipping non-JSON log entry {i}.")
@@ -206,25 +180,23 @@ def get_pocketoption_session_data(email: str, password: str, account_type: str) 
                 logger.error(f"Error processing log entry {i}: {e}", exc_info=True)
 
 
-        if found_full_ssid_string and found_uid:
-            session_data["ssid"] = found_full_ssid_string
-            session_data["uid"] = found_uid
+        if found_full_ssid_string:
             save_to_env("SSID", found_full_ssid_string)
-            save_to_env("UID", found_uid)
-            logger.info(f"Full SSID and UID for {account_type} account successfully extracted and saved to .env.")
+            logger.info("Full SSID string successfully extracted and saved to .env.")
+            return found_full_ssid_string
         else:
             logger.warning(
-                f"Full SSID string and/or UID pattern for {account_type} account not found in WebSocket logs after login."
+                "Full SSID string pattern not found in WebSocket logs after login."
             )
+            return None
 
     except Exception as e:
         logger.error(f"An error occurred during Edge automation: {e}", exc_info=True)
+        return None
     finally:
         if driver:
             driver.quit()
             logger.info("WebDriver closed.")
-    
-    return session_data
 
 
 if __name__ == "__main__":
@@ -241,22 +213,10 @@ if __name__ == "__main__":
     # Ensure shared_data directory exists
     os.makedirs(LOCAL_SHARED_DATA_DIR, exist_ok=True)
 
-    # --- User Prompt for Account Type ---
     while True:
-        user_choice = input("Enter account type to scrape (DEMO/REAL): ").strip().upper()
-        if user_choice in ["DEMO", "REAL"]:
-            break
-        else:
-            print("Invalid input. Please enter 'DEMO' or 'REAL'.")
-    # --- End User Prompt ---
-
-    while True:
-        logger.info(f"Attempting to refresh SSID and UID for {user_choice} account. Next refresh in {refresh_interval_minutes} minutes.")
-        session_info = get_pocketoption_session_data(email, password, user_choice) # Pass account_type to the function
-        if session_info["ssid"] and session_info["uid"]:
-            logger.info(f"SSID and UID extraction completed for {user_choice} account.")
-        else:
-            logger.error(f"Failed to extract SSID and/or UID for {user_choice} account.")
+        logger.info(f"Attempting to refresh SSID. Next refresh in {refresh_interval_minutes} minutes.")
+        get_pocketoption_ssid(email, password)
+        logger.info("SSID extraction attempt completed.")
         
         logger.info(f"Waiting {refresh_interval_minutes} minutes before next SSID refresh attempt.")
         time.sleep(refresh_interval_seconds)

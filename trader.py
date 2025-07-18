@@ -1,37 +1,37 @@
-# trader.py (Rewritten for FastAPI)
 import os
 import json
 import time
 import asyncio
 import logging
-from fastapi import FastAPI, Request, HTTPException, status # Import FastAPI components
-from fastapi.responses import JSONResponse # For returning JSON responses
-from pocketoptionapi_async import AsyncPocketOptionClient
-from datetime import datetime, timedelta
 import pytz
+from fastapi import FastAPI, Request, HTTPException, status
+from fastapi.responses import JSONResponse
+from datetime import datetime, timedelta
+from typing import Optional, AsyncIterator, Any
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
 
-# Import our local parsing utility
+from pocketoptionapi_async import AsyncPocketOptionClient, OrderDirection
+from pocketoptionapi_async.models import OrderResult # Only import what's directly used
+
 from parse_data import parse_macrodroid_trade_data
 
-# Configure logging for the FastAPI app and trading logic
+load_dotenv()
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI() # Initialize FastAPI app
+pocket_option_client: Optional[AsyncPocketOptionClient] = None
+is_demo_session: Optional[bool] = None
 
-# --- Configuration Constants ---
-SSID_FILE_PATH = "./shared_data/ssid.txt" 
-DEFAULT_ACCOUNT_TYPE = "PRACTICE" 
-FIXED_TRADE_DURATION_SECONDS = 300 
+FIXED_TRADE_DURATION_SECONDS = 300
 INITIAL_TRADE_AMOUNT = 1.0
 MARTINGALE_MULTIPLIER = 2.0
-MAX_MARTINGALE_LEVELS = 2 
+MAX_MARTINGALE_LEVELS = 2
 
-# --- Timezone Configuration ---
 SIGNAL_TIMEZONE = pytz.timezone('America/New_York')
 LOCAL_TIMEZONE = pytz.timezone('Africa/Windhoek')
 
-# --- Global State Management ---
 trade_sequence_state = {
     "active": False,
     "asset": None,
@@ -39,171 +39,75 @@ trade_sequence_state = {
     "current_level": 0,
     "current_amount": INITIAL_TRADE_AMOUNT,
     "last_trade_id": None,
-    "last_trade_status": None
+    "last_trade_status": None,
+    # Removed open_price and open_time from here as they are not available immediately
+    # and are retrieved when checking order result.
 }
 
-# Pocket Option API client instance - now managed directly as a global
-pocket_option_api = None
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    global pocket_option_client, is_demo_session
 
-# --- Utility Functions ---
+    logger.info("FastAPI lifespan startup event: Initializing Pocket Option client.")
 
-def read_ssid_from_file(retries=10, delay_seconds=5):
-    """
-    Reads the SSID from the shared file with retries.
-    """
-    for i in range(retries):
-        try:
-            if os.path.exists(SSID_FILE_PATH):
-                with open(SSID_FILE_PATH, "r") as f:
-                    ssid = f.read().strip()
-                if ssid:
-                    logger.info(f"SSID successfully read from {SSID_FILE_PATH}")
-                    return ssid
-            logger.warning(f"SSID file not found or empty: {SSID_FILE_PATH}. Retrying in {delay_seconds}s...")
-        except Exception as e:
-            logger.error(f"Error reading SSID from file {SSID_FILE_PATH}: {e}. Retrying in {delay_seconds}s...")
-        time.sleep(delay_seconds)
-    logger.critical(f"Failed to read SSID from {SSID_FILE_PATH} after {retries} attempts. Please ensure scraper.py is running.")
-    return None
+    while True:
+        user_choice = input("Enter account type to use for trading (DEMO/REAL): ").strip().upper()
+        if user_choice == "DEMO":
+            is_demo_session = True
+            logger.info("Selected DEMO account for trading session.")
+            break
+        elif user_choice == "REAL":
+            is_demo_session = False
+            logger.info("Selected REAL account for trading session.")
+            break
+        else:
+            print("Invalid input. Please enter 'DEMO' or 'REAL'.")
 
-async def connect_to_pocket_option():
-    """
-    Establishes and manages the connection to Pocket Option API using the SSID.
-    Ensures only one active connection.
-    """
-    global pocket_option_api
-
-    if pocket_option_api and pocket_option_api.check_connection():
-        logger.info("Pocket Option API client already connected.")
-        return True
-
-    ssid = read_ssid_from_file()
+    ssid = os.getenv('SSID')
+    uid = os.getenv('UID')
+    
     if not ssid:
-        logger.error("Pocket Option SSID not available. Cannot connect.")
-        return False
+        logger.critical("SSID not found in .env. Please run scraper.py first to obtain it.")
+        yield
+        return
+    if not uid:
+        logger.critical("UID not found in .env. Please run scraper.py first to obtain it.")
+        yield
+        return
 
-    logger.info("Attempting to connect to Pocket Option using SSID.")
-    pocket_option_api = AsyncPocketOptionClient(ssid, is_demo=(DEFAULT_ACCOUNT_TYPE == "PRACTICE"))
+    pocket_option_client = AsyncPocketOptionClient(ssid, is_demo=is_demo_session)
 
     try:
-        connected = await pocket_option_api.connect()
-        if not connected:
-            logger.error("Pocket Option login failed. Check PocketOptionAPI logs for details (e.g., Authentication timeout).")
-            pocket_option_api = None 
-            return False
-        logger.info("Successfully connected to PocketOption API.")
+        await pocket_option_client.connect()
+        logger.info("Pocket Option client connected successfully on startup.")
+        
+        balance = await pocket_option_client.get_balance()
+        logger.info(f'Startup Balance: {balance.balance} {balance.currency} (Is Demo: {balance.is_demo})')
 
-        await pocket_option_api.set_act(DEFAULT_ACCOUNT_TYPE)
-        logger.info(f"Switched to {DEFAULT_ACCOUNT_TYPE} account.")
-
-        balance = await pocket_option_api.get_balance()
-        logger.info(f"Current {DEFAULT_ACCOUNT_TYPE} Balance: {balance}")
-        return True
     except Exception as e:
-        logger.critical(f"An unexpected error occurred during Pocket Option connection: {e}", exc_info=True)
-        pocket_option_api = None 
-        return False
-
-async def place_trade(asset: str, direction: str, amount: float, duration: int):
-    """
-    Places a trade on Pocket Option.
-    Returns (True, trade_id) on success, (False, error_message) on failure.
-    """
-    if not pocket_option_api or not pocket_option_api.check_connection():
-        logger.error("Pocket Option API not connected. Cannot place trade.")
-        return False, "API not connected"
-
-    logger.info(f"Attempting to place trade: Asset={asset}, Direction={direction}, Amount=${amount}, Duration={duration}s")
-    try:
-        status, trade_id = await pocket_option_api.buy(
-            amount=amount,
-            asset=asset,
-            action=direction,
-            timeframe=duration
-        )
-
-        if status:
-            logger.info(f"Trade successfully placed! Asset: {asset}, Direction: {direction}, Amount: ${amount}, Trade ID: {trade_id}")
-            return True, trade_id
-        else:
-            logger.error(f"Failed to place trade for {asset} ({direction} ${amount}): {trade_id}")
-            return False, trade_id
-    except Exception as e:
-        logger.error(f"Error placing trade: {e}", exc_info=True)
-        return False, str(e)
-
-async def monitor_trade_outcome(trade_id: int, expected_duration: int):
-    """
-    Monitors the outcome of a single trade.
-    """
-    logger.info(f"Monitoring trade ID: {trade_id}. Waiting for trade to expire and result to be available...")
+        logger.error(f"Initial Pocket Option client connection failed on startup: {e}", exc_info=True)
+        pocket_option_client = None
     
-    await asyncio.sleep(expected_duration + 15) # Wait for trade duration + buffer
+    yield
 
-    max_retries = 5
-    retry_delay = 3 # seconds
-    for attempt in range(max_retries):
-        try:
-            if not pocket_option_api or not pocket_option_api.check_connection():
-                logger.error("API not connected while monitoring trade outcome. Cannot get result.")
-                return "error"
+    logger.info("FastAPI lifespan shutdown event: Disconnecting Pocket Option client.")
+    if pocket_option_client:
+        await pocket_option_client.disconnect()
+        logger.info("Pocket Option client disconnected during shutdown.")
 
-            # --- SIMULATED OUTCOME ---
-            import random
-            outcome = random.choice(["win", "loss"]) # Simulate outcome
-            logger.info(f"Simulated outcome for trade ID {trade_id} (Attempt {attempt+1}/{max_retries}): {outcome}")
-            return outcome
-            # --- END SIMULATED OUTCOME ---
+app = FastAPI(lifespan=lifespan)
 
-        except Exception as e:
-            logger.warning(f"Error fetching trade history for ID {trade_id} (Attempt {attempt+1}/{max_retries}): {e}")
-            await asyncio.sleep(retry_delay)
-    
-    logger.error(f"Failed to get outcome for trade ID {trade_id} after {max_retries} attempts.")
-    return "error"
+@app.post('/trade_signal')
+async def trade_signal_webhook(request: Request) -> JSONResponse:
+    global trade_sequence_state, pocket_option_client, is_demo_session
 
-async def handle_trade_outcome_and_martingale(trade_id: int, duration: int, asset: str, direction: str, amount: float):
-    """
-    Handles the outcome of a trade and applies Martingale logic based on the global state.
-    This function runs as a separate asyncio task after a trade is placed.
-    """
-    global trade_sequence_state
-
-    outcome = await monitor_trade_outcome(trade_id, duration)
-    trade_sequence_state["last_trade_status"] = outcome
-
-    logger.info(f"Outcome for trade ID {trade_id} ({asset} {direction} ${amount}): {outcome}")
-
-    if outcome == "win":
-        logger.info(f"Trade WIN for {asset} {direction} ${amount}. Resetting Martingale sequence.")
-        trade_sequence_state["active"] = False
-        trade_sequence_state["current_level"] = 0
-        trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
-    elif outcome == "loss":
-        if trade_sequence_state["current_level"] < MAX_MARTINGALE_LEVELS:
-            logger.info(f"Trade LOSS for {asset} {direction} ${amount}. Waiting for next signal for re-entry.")
+    if not pocket_option_client or not pocket_option_client.is_connected:
+        logger.error("Pocket Option client is not connected. Cannot process trade signal.")
+        if await connect_pocket_option_client():
+             logger.info("Re-established Pocket Option connection for trade signal.")
         else:
-            logger.info(f"Trade LOSS for {asset} {direction} ${amount} at final Martingale level ({MAX_MARTINGALE_LEVELS + 1}). Resetting sequence.")
-            trade_sequence_state["active"] = False
-            trade_sequence_state["current_level"] = 0
-            trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
-    else: # "error" or unexpected outcome
-        logger.error(f"Error or unexpected outcome '{outcome}' for trade ID {trade_id}. Resetting Martingale sequence to avoid issues.")
-        trade_sequence_state["active"] = False
-        trade_sequence_state["current_level"] = 0
-        trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Pocket Option API not connected.")
 
-# --- FastAPI Endpoint ---
-
-@app.post('/trade_signal') # Use @app.post for POST requests
-async def trade_signal_webhook(request: Request): # FastAPI uses Request object
-    """
-    Receives trade signals from Macrodroid (via Ngrok), parses them,
-    and executes trades with Martingale logic and precise timing.
-    """
-    global trade_sequence_state
-
-    # Read raw body directly from FastAPI Request object
     raw_notification_text = (await request.body()).decode('utf-8')
     logger.info(f"Received raw notification from Macrodroid:\n{raw_notification_text}")
 
@@ -214,15 +118,23 @@ async def trade_signal_webhook(request: Request): # FastAPI uses Request object
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Failed to parse trade data from notification.")
 
     signal_asset = parsed_data.get("asset_name_for_po")
-    signal_direction = parsed_data.get("direction")
+    signal_direction_str = parsed_data.get("direction")
     signal_entry_time_str = parsed_data.get("entryTime")
-    trade_duration = FIXED_TRADE_DURATION_SECONDS
+    trade_duration = parsed_data.get("duration", FIXED_TRADE_DURATION_SECONDS)
+
+    try:
+        signal_direction = OrderDirection[signal_direction_str.upper()]
+    except (KeyError, AttributeError):
+        logger.error(f"Invalid or missing trade direction received: '{signal_direction_str}'. Must be 'CALL' or 'PUT'.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid trade direction.")
 
     if not signal_entry_time_str:
         logger.error("Signal is missing 'Entry at HH:MM'. Cannot determine precise entry time. Aborting.")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Signal missing entry time.")
+    if not signal_asset:
+        logger.error("Signal is missing asset. Aborting trade.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Signal missing asset.")
 
-    # --- Timing Logic: Calculate Target Local Time ---
     current_local_dt = datetime.now(LOCAL_TIMEZONE)
     
     try:
@@ -239,7 +151,7 @@ async def trade_signal_webhook(request: Request): # FastAPI uses Request object
     logger.info(f"Signal entry time (GMT-4): {signal_entry_time_str}. Calculated local target entry time: {target_local_dt.strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
 
     if current_local_dt > target_local_dt + timedelta(seconds=5):
-        logger.warning(f"Signal for {signal_asset} {signal_direction} (Entry: {signal_entry_time_str}) arrived late. Current local time: {current_local_dt.strftime('%H:%M:%S')}, Target local time: {target_local_dt.strftime('%H:%M:%S')}. Skipping trade.")
+        logger.warning(f"Signal for {signal_asset} {signal_direction.value} (Entry: {signal_entry_time_str}) arrived late. Current local time: {current_local_dt.strftime('%H:%M:%S')}, Target local time: {target_local_dt.strftime('%H:%M:%S')}. Skipping trade.")
         trade_sequence_state["active"] = False
         trade_sequence_state["current_level"] = 0
         trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
@@ -247,71 +159,59 @@ async def trade_signal_webhook(request: Request): # FastAPI uses Request object
 
     time_to_wait_seconds = (target_local_dt - current_local_dt).total_seconds()
 
+    if trade_sequence_state["active"] and \
+       trade_sequence_state["asset"] == signal_asset and \
+       trade_sequence_state["direction"] == signal_direction and \
+       trade_sequence_state["current_level"] < MAX_MARTINGALE_LEVELS:
+        
+        logger.info(f"Ignoring new signal for {signal_asset} {signal_direction.value}."
+                    f" An active Martingale sequence is already in progress (Level {trade_sequence_state['current_level']+1})."
+                    f" Waiting for its outcome to decide next step or for a new, different signal.")
+        return JSONResponse(status_code=status.HTTP_200_OK, content={
+            "status": "ignored",
+            "message": "Signal ignored. Active Martingale sequence in progress for this asset/direction."
+        })
+    elif trade_sequence_state["active"] and \
+         (trade_sequence_state["asset"] != signal_asset or trade_sequence_state["direction"] != signal_direction):
+        logger.warning(f"New signal for {signal_asset} {signal_direction.value} received while another sequence "
+                       f"({trade_sequence_state['asset']} {trade_sequence_state['direction'].value}) was active. "
+                       f"Resetting previous sequence and starting new one.")
+        trade_sequence_state["active"] = False
+
+    logger.info(f"New signal received. Starting a new trade sequence for {signal_asset} {signal_direction.value}. Initial Amount: ${INITIAL_TRADE_AMOUNT:.2f}")
+    trade_sequence_state.update({
+        "active": True,
+        "asset": signal_asset,
+        "direction": signal_direction,
+        "current_level": 0,
+        "current_amount": INITIAL_TRADE_AMOUNT,
+        "last_trade_id": None,
+        "last_trade_status": "pending",
+    })
+
     if time_to_wait_seconds > 0:
         logger.info(f"Waiting {time_to_wait_seconds:.2f} seconds until target entry time: {target_local_dt.strftime('%H:%M:%S')}")
         await asyncio.sleep(time_to_wait_seconds)
-        logger.info(f"Reached target entry time. Proceeding with trade for {signal_asset} {signal_direction}.")
+        logger.info(f"Reached target entry time. Proceeding with trade for {signal_asset} {signal_direction.value}.")
     else:
         logger.info(f"Signal arrived exactly at or slightly past target entry time ({current_local_dt.strftime('%H:%M:%S')} vs {target_local_dt.strftime('%H:%M:%S')}). Placing trade immediately.")
 
+    try:
+        balance_before_trade = await pocket_option_client.get_balance()
+        logger.info(f"Balance BEFORE initial trade: {balance_before_trade.balance} {balance_before_trade.currency}")
+    except Exception as e:
+        logger.warning(f"Could not retrieve balance before initial trade: {e}")
 
-    # --- Martingale Strategy Logic ---
-    is_new_signal_type = (trade_sequence_state["asset"] != signal_asset or 
-                          trade_sequence_state["direction"] != signal_direction)
-
-    if is_new_signal_type or not trade_sequence_state["active"] or \
-       (trade_sequence_state["active"] and trade_sequence_state["last_trade_status"] == "win") or \
-       (trade_sequence_state["active"] and trade_sequence_state["last_trade_status"] == "loss" and trade_sequence_state["current_level"] >= MAX_MARTINGALE_LEVELS):
+    try:
+        order = await pocket_option_client.place_order(
+            asset=trade_sequence_state["asset"],
+            amount=trade_sequence_state["current_amount"],
+            direction=trade_sequence_state["direction"],
+            duration=trade_duration
+        )
+        logger.info(f"Initial trade placed successfully! Order ID: {order.order_id}, Status: {order.status}")
+        trade_sequence_state["last_trade_id"] = order.order_id
         
-        logger.info(f"Starting new trade sequence for {signal_asset} {signal_direction}. Initial Amount: ${INITIAL_TRADE_AMOUNT:.2f}")
-        trade_sequence_state = {
-            "active": True,
-            "asset": signal_asset,
-            "direction": signal_direction,
-            "current_level": 0,
-            "current_amount": INITIAL_TRADE_AMOUNT,
-            "last_trade_id": None,
-            "last_trade_status": "pending"
-        }
-    elif trade_sequence_state["active"] and \
-         trade_sequence_state["asset"] == signal_asset and \
-         trade_sequence_state["direction"] == signal_direction and \
-         trade_sequence_state["last_trade_status"] == "loss" and \
-         trade_sequence_state["current_level"] < MAX_MARTINGALE_LEVELS:
-        
-        trade_sequence_state["current_level"] += 1
-        trade_sequence_state["current_amount"] *= MARTINGALE_MULTIPLIER
-        logger.info(f"Continuing Martingale for {signal_asset} {signal_direction}. Level {trade_sequence_state['current_level']+1}. Amount: ${trade_sequence_state['current_amount']:.2f}")
-        trade_sequence_state["last_trade_status"] = "pending"
-    else:
-        logger.warning(f"Unexpected Martingale state for {signal_asset} {signal_direction}. Resetting sequence.")
-        trade_sequence_state = {
-            "active": True,
-            "asset": signal_asset,
-            "direction": signal_direction,
-            "current_level": 0,
-            "current_amount": INITIAL_TRADE_AMOUNT,
-            "last_trade_id": None,
-            "last_trade_status": "pending"
-        }
-
-    # Ensure connection to Pocket Option API
-    if not await connect_to_pocket_option():
-        logger.error("Could not establish or re-establish connection to Pocket Option. Aborting trade.")
-        trade_sequence_state["active"] = False
-        trade_sequence_state["current_level"] = 0
-        trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Pocket Option API connection failed.")
-
-    success, trade_info = await place_trade(
-        asset=trade_sequence_state["asset"],
-        direction=trade_sequence_state["direction"],
-        amount=trade_sequence_state["current_amount"],
-        duration=trade_duration
-    )
-
-    if success:
-        trade_sequence_state["last_trade_id"] = trade_info
         logger.info(f"Trade placed. Now initiating outcome monitoring for trade ID: {trade_sequence_state['last_trade_id']}")
         
         asyncio.create_task(
@@ -324,32 +224,146 @@ async def trade_signal_webhook(request: Request): # FastAPI uses Request object
             )
         )
         return JSONResponse(status_code=status.HTTP_200_OK, content={
-            "status": "trade_placed",
-            "message": "Trade placed successfully. Outcome will be processed shortly.",
+            "status": "initial_trade_placed",
+            "message": "Initial trade placed successfully. Outcome will be processed shortly.",
             "trade_id": trade_sequence_state["last_trade_id"],
             "asset": trade_sequence_state["asset"],
-            "direction": trade_sequence_state["direction"],
+            "direction": trade_sequence_state["direction"].value,
             "amount": trade_sequence_state["current_amount"],
             "martingale_level": trade_sequence_state["current_level"] + 1
         })
-    else:
-        logger.error(f"Failed to place trade: {trade_info}. Resetting Martingale sequence due to placement failure.")
+    except Exception as e:
+        logger.error(f"Failed to place initial trade: {e}", exc_info=True)
         trade_sequence_state["active"] = False
         trade_sequence_state["current_level"] = 0
         trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to place trade: {trade_info}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to place initial trade: {e}")
 
-# --- Application Startup Event (FastAPI equivalent of before_serving) ---
-@app.on_event("startup")
-async def startup_event():
-    """
-    FastAPI startup event to initialize the PocketOption API client.
-    """
-    logger.info("FastAPI startup event: Initializing PocketOption API client.")
-    success = await connect_to_pocket_option() # Use the connect_to_pocket_option function
-    if not success:
-        logger.critical("Failed to initialize PocketOption API client on startup. Trading will not work.")
+
+async def connect_pocket_option_client() -> bool:
+    global pocket_option_client, is_demo_session
+
+    if pocket_option_client and pocket_option_client.is_connected:
+        logger.info("Pocket Option client is already connected.")
+        return True
+
+    ssid = os.getenv('SSID')
+    uid = os.getenv('UID')
+    
+    if not ssid:
+        logger.critical("SSID not found in .env. Cannot connect.")
+        return False
+    if not uid:
+        logger.critical("UID not found in .env. Cannot connect.")
+        return False
+
+    if is_demo_session is None:
+        logger.critical("Account type (DEMO/REAL) not set during startup. Cannot connect.")
+        return False
+
+    try:
+        if not pocket_option_client:
+            pocket_option_client = AsyncPocketOptionClient(ssid, is_demo=is_demo_session)
+        
+        await pocket_option_client.connect()
+        logger.info("Pocket Option client re-connected successfully.")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to re-connect Pocket Option client: {e}", exc_info=True)
+        pocket_option_client = None
+        return False
+
+
+async def handle_trade_outcome_and_martingale(trade_id: int, duration: int, asset: str, direction: OrderDirection, amount: float) -> None:
+    global trade_sequence_state, pocket_option_client
+
+    logger.info(f"Monitoring trade ID: {trade_id}. Waiting for trade to expire and result to be available...")
+    
+    # Wait for the trade duration plus a buffer for the result to come in.
+    # The "5 seconds before end" check will now be part of the final result check,
+    # as open_price is only available from check_order_result.
+    await asyncio.sleep(duration + 5) # Wait for trade to end + 5s buffer for result propagation
+
+    outcome = "loss"
+    trade_details: Optional[OrderResult] = None
+
+    if not pocket_option_client or not pocket_option_client.is_connected:
+        logger.warning(f"Pocket Option client not connected for final check of trade ID {trade_id}. Assuming loss for Martingale progression.")
     else:
-        logger.info("PocketOption API client initialized successfully during startup.")
+        try:
+            trade_details = await pocket_option_client.check_order_result(trade_id)
+            if trade_details:
+                logger.info(f"Official final outcome for trade ID {trade_id}: Status={trade_details.status}, Profit={trade_details.profit}, Open Price: {trade_details.open_price}, Close Price: {trade_details.close_price}")
+                if trade_details.status == "win":
+                    outcome = "win"
+                elif trade_details.status == "lose":
+                    outcome = "loss"
+                else:
+                    logger.warning(f"Unexpected final trade result status: {trade_details.status}. Treating as loss for Martingale.")
+                    outcome = "loss"
+            else:
+                logger.warning(f"Could not retrieve final result for trade ID {trade_id}. Treating as loss for Martingale.")
+                outcome = "loss"
+        except Exception as e:
+            logger.error(f"Error checking final trade result for ID {trade_id}: {e}. Treating as loss for Martingale.", exc_info=True)
+            outcome = "loss"
 
-# No __name__ == '__main__' block for FastAPI, Uvicorn runs it directly.
+    trade_sequence_state["last_trade_status"] = outcome
+
+    logger.info(f"Final outcome for trade ID {trade_id} ({asset} {direction.value} ${amount}): {outcome}")
+
+    try:
+        balance_after_trade = await pocket_option_client.get_balance()
+        logger.info(f"Balance AFTER trade ID {trade_id}: {balance_after_trade.balance} {balance_after_trade.currency}")
+    except Exception as e:
+        logger.warning(f"Could not retrieve balance after trade ID {trade_id}: {e}")
+
+
+    if outcome == "loss":
+        if trade_sequence_state["current_level"] < MAX_MARTINGALE_LEVELS:
+            trade_sequence_state["current_level"] += 1
+            trade_sequence_state["current_amount"] *= MARTINGALE_MULTIPLIER
+            
+            logger.info(f"Trade LOSS for {asset} {direction.value} ${amount}. Proceeding with Martingale Level {trade_sequence_state['current_level']+1}. New Amount: ${trade_sequence_state['current_amount']:.2f}")
+
+            try:
+                balance_before_martingale = await pocket_option_client.get_balance()
+                logger.info(f"Balance BEFORE Martingale Level {trade_sequence_state['current_level']+1} trade: {balance_before_martingale.balance} {balance_before_martingale.currency}")
+            except Exception as e:
+                logger.warning(f"Could not retrieve balance before Martingale trade: {e}")
+
+            try:
+                next_order = await pocket_option_client.place_order(
+                    asset=trade_sequence_state["asset"],
+                    amount=trade_sequence_state["current_amount"],
+                    direction=trade_sequence_state["direction"],
+                    duration=duration
+                )
+                logger.info(f"Martingale Level {trade_sequence_state['current_level']+1} trade placed successfully! Order ID: {next_order.order_id}, Status: {next_order.status}")
+                trade_sequence_state["last_trade_id"] = next_order.order_id
+
+                asyncio.create_task(
+                    handle_trade_outcome_and_martingale(
+                        trade_sequence_state["last_trade_id"],
+                        duration,
+                        trade_sequence_state["asset"],
+                        trade_sequence_state["direction"],
+                        trade_sequence_state["current_amount"]
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Failed to place Martingale Level {trade_sequence_state['current_level']+1} trade: {e}", exc_info=True)
+                trade_sequence_state["active"] = False
+                trade_sequence_state["current_level"] = 0
+                trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
+        else:
+            logger.info(f"Trade LOSS for {asset} {direction.value} ${amount} at final Martingale level ({MAX_MARTINGALE_LEVELS + 1}). Resetting sequence. Waiting for next signal.")
+            trade_sequence_state["active"] = False
+            trade_sequence_state["current_level"] = 0
+            trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
+    else:
+        logger.info(f"Trade WIN for {asset} {direction.value} ${amount}. Resetting Martingale sequence. Waiting for next signal.")
+        trade_sequence_state["active"] = False
+        trade_sequence_state["current_level"] = 0
+        trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
+
