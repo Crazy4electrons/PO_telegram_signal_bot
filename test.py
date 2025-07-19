@@ -15,14 +15,6 @@ NOTIFICATION_TEMPLATE = """
 🕘 Expiration 5M
 ⏺ Entry at {entry_time}
 {direction_emoji} {direction_text}
-
-🔼 Martingale levels
-1️⃣ level at 08:40
-2️⃣ level at 08:45
-3️⃣ level at 08:50
-
-💥 GET THIS SIGNAL HERE!
-💰 HOW TO START?
 """
 
 def get_asset_emojis(asset_pair):
