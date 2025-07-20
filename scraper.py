@@ -21,7 +21,7 @@ load_dotenv()
 
 # --- MANUAL EDGE DRIVER PATH ---
 # This path must point to your msedgedriver.exe
-MANUAL_EDGEDRIVER_PATH = r"C:\Users\IT-SUPPORT-03\Documents\letGo\drivers\msedgedriver.exe"
+MANUAL_EDGEDRIVER_PATH = r"C:\\Users\\swart\\Desktop\\_\\Projects\\trader_bot\\letGo\\drivers\\msedgedriver.exe"
 # -------------------------------
 
 # Configure logging for this script.

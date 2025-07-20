@@ -3,3 +3,5 @@ browser_profiles
 .env
 __pycache__
 ssid.txt
+.vscode
+.conda
