@@ -280,7 +280,7 @@ async def connect_pocket_option_client() -> bool:
 
     try:
         if not pocket_option_client:
-            pocket_option_client = AsyncPocketOptionClient(ssid, is_demo=is_demo_session)
+            pocket_option_client = AsyncPocketOptionClient(ssid, is_demo=is_demo_session,enable_logging=False)
             
         await pocket_option_client.connect()
         return True
@@ -298,7 +298,6 @@ async def monitor_trade_and_execute_martingale(trade_id: int, duration: int, ass
     await asyncio.sleep(duration)
     
     # --- Step 1: Get the profit amount for this specific trade from OrderResult ---
-    # We still need check_order_result to get the 'profit' field, even if 'status' is bugged.
     trade_details_for_profit: Optional[OrderResult] = None
     MAX_DETAILS_RETRIES = 15 # Increased retries for getting profit details
     DETAILS_RETRY_INTERVAL = 1 # seconds
@@ -319,8 +318,7 @@ async def monitor_trade_and_execute_martingale(trade_id: int, duration: int, ass
     if trade_details_for_profit is None or trade_details_for_profit.profit is None:
         logger.error(f"Trade ID {trade_id}: Failed to retrieve trade details for profit after {MAX_DETAILS_RETRIES} attempts. Cannot accurately determine win/loss by balance. Assuming loss.")
         martingale_reentry_needed = True
-        # Update balance_before_current_trade for next level (if this was a loss)
-        # Assuming balance is reduced by invested_amount if profit details are missing
+        # If profit details are missing, assume balance would decrease by invested_amount on loss
         trade_sequence_state["balance_before_current_trade"] = balance_before_this_trade - invested_amount
         await execute_martingale_or_reset(trade_id, duration, asset, direction, invested_amount, martingale_reentry_needed)
         return
@@ -332,7 +330,7 @@ async def monitor_trade_and_execute_martingale(trade_id: int, duration: int, ass
     if not current_balance_obj:
         logger.error(f"Trade ID {trade_id}: Failed to retrieve valid current balance after trade. Cannot determine trade outcome. Assuming loss.")
         martingale_reentry_needed = True
-        # Update balance_before_current_trade for next level (if this was a loss)
+        # If current balance cannot be retrieved, assume loss and update balance accordingly
         trade_sequence_state["balance_before_current_trade"] = balance_before_this_trade - invested_amount
         await execute_martingale_or_reset(trade_id, duration, asset, direction, invested_amount, martingale_reentry_needed)
         return
@@ -340,7 +338,8 @@ async def monitor_trade_and_execute_martingale(trade_id: int, duration: int, ass
 
     # --- Step 3: Determine outcome based on balance change ---
     expected_balance_if_loss = balance_before_this_trade - invested_amount
-    expected_balance_if_win = balance_before_this_trade + profit_amount_if_won
+    # Updated: For a win, the final balance is the initial balance + net profit + invested amount returned
+    expected_balance_if_win = balance_before_this_trade + profit_amount_if_won + invested_amount 
 
     # Use a small tolerance for floating point comparisons
     TOLERANCE = 0.01 # 1 cent tolerance
