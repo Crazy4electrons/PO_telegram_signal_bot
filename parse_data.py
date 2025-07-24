@@ -1,4 +1,3 @@
-# parse_data.py
 import re
 import logging
 
@@ -6,67 +5,74 @@ logger = logging.getLogger(__name__)
 
 def parse_macrodroid_trade_data(notification_text: str) -> dict:
     """
-    Parses ONLY the asset pair, entry time, and direction from notification text.
-    All other information is ignored.
+    Parses trade data from a MacroDroid notification text.
+
+    Args:
+        notification_text: The full text of the MacroDroid notification.
+
+    Returns:
+        A dictionary containing parsed trade data (asset_name_for_po, direction, entryTime).
+        Returns an empty dictionary or a dictionary with None values for fields that couldn't be parsed.
     """
     parsed_data = {}
 
-    # --- Asset Detection ---
-    # Prioritize 6-character currency pairs (e.g., EURUSD, GBPJPY) or #STOCK formats.
-    # Look anywhere in the text, case-insensitive.
-    # The (?:_OTC)? makes _OTC optional if present.
-    asset_match = re.search(r"([A-Z]{6}(?:_otc)?|#[A-Za-z_]+)", notification_text, re.IGNORECASE)
-
+    # --- 1. Parse Asset Name (Currency Pair) ---
+    # Matches patterns like "GBP/AUD", "EUR/USD", including country flags
+    # Example: 🇬🇧 GBP/AUD 🇦🇺 OTC or EUR/USD
+    asset_match = re.search(r'(?:[A-Z]{2,3}\s*\/[A-Z]{2,3}|[A-Z]{6})(?=\s*OTC)?', notification_text, re.IGNORECASE)
     if asset_match:
-        asset_name = asset_match.group(1).strip().upper()
-        
-        # Always append "_OTC" for 6-character currency pairs if not already present.
-        # This standardizes the format for Pocket Option API.
-        if len(asset_name) == 6 and asset_name.isalpha() and not asset_name.endswith("_otc"):
-            parsed_data["asset_name_for_po"] = asset_name + "_otc"
+        asset = asset_match.group(0).replace('/', '').strip().upper() # Remove slash and spaces
+        # Check if OTC is mentioned in the full notification text
+        if re.search(r'OTC', notification_text, re.IGNORECASE):
+            asset_for_po = f"{asset}_otc"
+            logger.info(f"Detected Asset: {asset_match.group(0)} -> PO API Name: {asset_for_po}")
         else:
-            parsed_data["asset_name_for_po"] = asset_name
-        
-        logger.info(f"Detected Asset: {asset_name} -> PO API Name: {parsed_data['asset_name_for_po']}")
+            asset_for_po = asset
+            logger.info(f"Detected Asset: {asset_match.group(0)} -> PO API Name: {asset_for_po} (Non-OTC)")
+        parsed_data['asset_name_for_po'] = asset_for_po
     else:
         logger.warning("Could not detect Asset from notification text.")
 
-
-    # --- Direction Detection ---
-    # Look for BUY, SELL, CALL, or PUT anywhere, case-insensitive.
-    direction_match = re.search(r"\b(BUY|SELL|CALL|PUT)\b", notification_text, re.IGNORECASE)
-
+    # --- 2. Parse Direction (BUY/SELL) ---
+    # Matches 'BUY' or 'SELL', possibly with leading/trailing symbols like '🟩'
+    direction_match = re.search(r'(?:🟩\s*BUY|🟥\s*SELL|BUY|SELL)', notification_text, re.IGNORECASE)
     if direction_match:
-        direction_str = direction_match.group(1).strip().upper()
-        if "BUY" in direction_str:
-            parsed_data["direction"] = "CALL"
-            logger.info("Detected Direction: BUY -> CALL")
-        elif "SELL" in direction_str:
-            parsed_data["direction"] = "PUT"
-            logger.info("Detected Direction: SELL -> PUT")
-        elif direction_str in ["CALL", "PUT"]:
-            parsed_data["direction"] = direction_str
-            logger.info(f"Detected Direction: {direction_str}")
+        direction_raw = direction_match.group(0).replace('🟩', '').replace('🟥', '').strip().upper()
+        if 'BUY' in direction_raw:
+            direction_for_po = 'CALL'
+            logger.info(f"Detected Direction: {direction_raw} -> {direction_for_po}")
+        elif 'SELL' in direction_raw:
+            direction_for_po = 'PUT'
+            logger.info(f"Detected Direction: {direction_raw} -> {direction_for_po}")
+        else:
+            direction_for_po = None
+            logger.warning(f"Detected direction '{direction_raw}' but could not map to CALL/PUT.")
+        parsed_data['direction'] = direction_for_po
     else:
         logger.warning("Could not detect Direction from notification text.")
 
-
-    # --- Entry Time Detection ---
-    # Look for HH:MM pattern anywhere in the text.
-    entry_time_match = re.search(r"(\d{2}:\d{2})", notification_text)
+    # --- 3. Parse Entry Time ---
+    # Matches patterns like 'Entry at 04:25' or just '04:25' if it's clearly a time.
+    # Prioritize 'Entry at HH:MM' or 'Expiration HH:MM'
+    entry_time_match = re.search(r'(?:Entry at|Expiration)\s*(\d{2}:\d{2})', notification_text)
     if entry_time_match:
-        parsed_data["entryTime"] = entry_time_match.group(1).strip()
-        logger.info(f"Detected Entry Time: {parsed_data['entryTime']}")
+        entry_time = entry_time_match.group(1)
+        logger.info(f"Detected Entry Time: {entry_time}")
+        parsed_data['entryTime'] = entry_time
     else:
-        logger.warning("Could not detect Entry Time from notification text.")
+        # Fallback for just HH:MM if not explicitly an "Entry at" or "Expiration" time
+        # This is less robust and might pick up other times, but handles simpler formats
+        time_only_match = re.search(r'\b(\d{2}:\d{2})\b', notification_text)
+        if time_only_match:
+            entry_time = time_only_match.group(1)
+            logger.info(f"Detected (fallback) Entry Time: {entry_time}")
+            parsed_data['entryTime'] = entry_time
+        else:
+            logger.warning("Could not detect Entry Time from notification text.")
 
-    # Duration and any other extractions are intentionally omitted as per user request.
-
-
-    if parsed_data:
-        logger.info(f"Successfully parsed raw notification into: {parsed_data}")
-    else:
-        logger.error("No trade data could be parsed from the notification. Check signal format and regex patterns.")
-
+    if not parsed_data.get("asset_name_for_po") or not parsed_data.get("direction") or not parsed_data.get("entryTime"):
+        logger.warning("No essential trade data could be parsed from the notification. Check signal format and regex patterns.")
+        
+    logger.info(f"Successfully parsed raw notification into: {parsed_data}")
     return parsed_data
 
