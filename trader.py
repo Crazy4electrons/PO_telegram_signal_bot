@@ -189,34 +189,22 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
         current_local_dt = datetime.now(LOCAL_TIMEZONE)
         
         try:
-            # Parse the signal entry time (e.g., "22:00") into a time object
+            # Parse the signal entry time (e.g., "02:00") into a time object
             signal_time_obj = datetime.strptime(signal_entry_time_str, "%H:%M").time()
-
+            
             # Combine the current date with the signal time to create a naive datetime object
-            signal_dt = datetime.combine(current_local_dt.date(), signal_time_obj)
+            # This is done using the *current local date*
+            naive_signal_dt_on_current_day = datetime.combine(current_local_dt.date(), signal_time_obj)
 
-            # Add 6 hours to account for the time difference
-            signal_dt += timedelta(hours=6)
+            # Localize this naive datetime to the SIGNAL_TIMEZONE (America/New_York)
+            signal_dt_aware_signal_tz = SIGNAL_TIMEZONE.localize(naive_signal_dt_on_current_day)
 
-            # Adjust the date if the resulting time crosses midnight
-            if signal_dt.date() > current_local_dt.date():
-                logger.info(f"Signal time adjusted to the next day: {signal_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-            elif signal_dt.date() < current_local_dt.date():
-                logger.info(f"Signal time adjusted to the previous day: {signal_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-
-            target_local_dt = signal_dt
-
-            # Check if the signal is late
-            if current_local_dt > target_local_dt + timedelta(seconds=5):
-                logger.info(f"Signal for {signal_asset} arrived late. Current: {current_local_dt.strftime('%H:%M:%S')}, Target: {target_local_dt.strftime('%H:%M:%S')}. Skipping trade.")
-                reset_trade_sequence_state()  # Reset state when skipping trade
-                return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "skipped", "message": "Signal arrived too late, trade skipped."})
-
-            logger.info(f"Signal for {signal_asset} {signal_direction.value}. Entry: {signal_entry_time_str} (EDT). Local target: {target_local_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            # Convert this timezone-aware datetime to the LOCAL_TIMEZONE (Africa/Windhoek)
+            target_local_dt = signal_dt_aware_signal_tz.astimezone(LOCAL_TIMEZONE)
 
         except Exception as e:
             logger.error(f"Error processing signal entry time '{signal_entry_time_str}': {e}")
-            reset_trade_sequence_state()  # Ensure reset if time parsing fails
+            reset_trade_sequence_state() # Ensure reset if time parsing fails
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid signal entry time format: {e}")
 
         # Use signal_dt_aware_signal_tz for displaying the original signal time in logs
@@ -228,7 +216,9 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
             logger.info(f"Signal for {signal_asset} arrived too late. Current: {current_local_dt.strftime('%H:%M:%S')}, Target: {target_local_dt.strftime('%H:%M:%S')}. Skipping trade.")
             reset_trade_sequence_state() # Ensure reset if signal is too late
             return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "skipped", "message": "Signal arrived too late, trade skipped."})
-
+        
+        # If the signal is not too late for TODAY, but its target time is in the past (e.g., arrived 1 second late)
+        # then we should still proceed and not wait.
         time_to_wait_seconds = (target_local_dt - current_local_dt).total_seconds()
 
         logger.info(f"Initiating new trade sequence for {signal_asset} {signal_direction.value}. Initial Amount: ${INITIAL_TRADE_AMOUNT:.2f}")
@@ -252,7 +242,7 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
             logger.warning("Could not retrieve balance before initial trade attempt for logging purposes.")
 
 
-        if time_to_wait_seconds > 0.05:
+        if time_to_wait_seconds > 0.05: # Only wait if there's a meaningful amount of time to wait
             logger.info(f"Waiting {time_to_wait_seconds:.2f}s until {target_local_dt.strftime('%H:%M:%S')}.")
             await asyncio.sleep(time_to_wait_seconds)
             logger.info(f"Reached target entry time. Placing trade for {signal_asset} {signal_direction.value}.")
