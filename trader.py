@@ -57,18 +57,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     logger.info("FastAPI lifespan startup event: Initializing Pocket Option client.")
 
-    while True:
-        user_choice = input("Enter account type to use for trading (DEMO/REAL): ").strip().upper()
-        if user_choice == "DEMO":
-            is_demo_session = True
-            logger.info("Selected DEMO account for trading session.")
-            break
-        elif user_choice == "REAL":
-            is_demo_session = False
-            logger.info("Selected REAL account for trading session.")
-            break
-        else:
-            print("Invalid input. Please enter 'DEMO' or 'REAL'.")
+    # Determine account type from environment variable
+    account_type_env = os.getenv('ACCOUNT_TYPE', 'DEMO').strip().upper()
+    if account_type_env == "REAL":
+        is_demo_session = False
+        logger.info("Selected REAL account for trading session (from ACCOUNT_TYPE env variable).")
+    else:
+        is_demo_session = True
+        logger.info("Selected DEMO account for trading session (default or from ACCOUNT_TYPE env variable).")
 
     ssid = os.getenv('SSID')
     uid = os.getenv('UID')
