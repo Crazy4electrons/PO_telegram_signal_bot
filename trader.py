@@ -318,9 +318,13 @@ async def connect_pocket_option_client() -> bool:
 async def monitor_trade_and_execute_martingale(trade_id: int, duration: int, asset: str, direction: OrderDirection, invested_amount: float, balance_after_trade_placement: float) -> None:
     global trade_sequence_state, pocket_option_client, is_processing_trade_sequence
 
+    # Log the level correctly at the start of THIS monitoring task
+    # This current_level is for the trade_id being monitored in THIS call.
+    # It reflects the state when THIS task was created.
+    current_monitoring_level_for_log = trade_sequence_state["current_level"]
+    logger.info(f"Trade ID {trade_id} (Level {current_monitoring_level_for_log}). Waiting {duration}s for trade to conclude.")
+
     try:
-        # Wait for the full trade duration to elapse
-        logger.info(f"Trade ID {trade_id} (Level {trade_sequence_state['current_level']}). Waiting {duration}s for trade to conclude.")
         await asyncio.sleep(duration)
         
         # --- Step 1: Get the profit amount for this specific trade from OrderResult (still needed to confirm trade is finished) ---
@@ -380,23 +384,18 @@ async def monitor_trade_and_execute_martingale(trade_id: int, duration: int, ass
 
     except Exception as e:
         logger.error(f"An unexpected error occurred during trade monitoring for Trade ID {trade_id}: {e}. Resetting trade sequence.")
-        # Ensure reset if any unhandled exception occurs in monitoring
         reset_trade_sequence_state()
-    finally:
-        # Always reset the state when this monitor task finishes its execution path.
-        # If a new Martingale trade was placed, a new task was created, and that new task will set
-        # is_processing_trade_sequence = True.
-        # This prevents the flag from getting stuck if the task completes without explicitly
-        # triggering another Martingale trade or hitting the final reset in execute_martingale_or_reset.
-        logger.info(f"Monitor task for Trade ID {trade_id} concluded. Resetting global trade state.")
-        reset_trade_sequence_state()
+    # Removed the finally block to prevent premature state resets.
+    # The reset will now only occur within execute_martingale_or_reset when the sequence truly ends.
 
 
 async def execute_martingale_or_reset(trade_id: int, duration: int, asset: str, direction: OrderDirection, amount: float, martingale_reentry_needed: bool):
     global trade_sequence_state, pocket_option_client, is_processing_trade_sequence
 
     if martingale_reentry_needed:
-        logger.info(f"Trade ID {trade_id}: Official LOSS (or uncertain). Martingale Level: {trade_sequence_state['current_level']}.")
+        # Log the actual current_level from trade_sequence_state for decision making
+        logger.info(f"Trade ID {trade_id}: Official LOSS (or uncertain). Current Martingale Level before action: {trade_sequence_state['current_level']}.")
+
         if trade_sequence_state["current_level"] < MAX_MARTINGALE_LEVELS:
             trade_sequence_state["current_level"] += 1
             trade_sequence_state["current_amount"] *= MARTINGALE_MULTIPLIER
