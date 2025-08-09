@@ -1,11 +1,11 @@
 import os
 import json
-import time
+# import time
 import asyncio
 import pytz
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import JSONResponse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta,time
 from typing import Optional, AsyncIterator, Any
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -194,9 +194,13 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
 
             # Localize this naive datetime to the SIGNAL_TIMEZONE (America/New_York)
             signal_dt_aware_signal_tz = SIGNAL_TIMEZONE.localize(naive_signal_dt_on_current_day)
-
+            
             # Convert this timezone-aware datetime to the LOCAL_TIMEZONE (Africa/Windhoek)
             target_local_dt = signal_dt_aware_signal_tz.astimezone(LOCAL_TIMEZONE)
+            
+            if current_local_dt.time() < time(6,30):
+            # Subtract one day from the current local datetime
+                target_local_dt = target_local_dt - timedelta(days=1)
 
         except Exception as e:
             logger.error(f"Error processing signal entry time '{signal_entry_time_str}': {e}")
