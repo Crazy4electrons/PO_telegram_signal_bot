@@ -5,3 +5,8 @@ __pycache__
 ssid.txt
 .vscode
 .conda
+
+# Environment files
+*.dev
+*.env
+env/

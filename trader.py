@@ -35,7 +35,7 @@ is_processing_trade_sequence: bool = False
 FIXED_TRADE_DURATION_SECONDS = 300 # 5 minutes
 INITIAL_TRADE_AMOUNT = 1.0
 MARTINGALE_MULTIPLIER = 2.0
-MAX_MARTINGALE_LEVELS = 2 # Max Martingale levels after the initial trade (0-indexed). So 0=initial, 1=1st Martingale, 2=2nd Martingale (total 3 trades max).
+MAX_MARTINGALE_LEVELS = 3# Max Martingale levels after the initial trade (0-indexed). So 0=initial, 1=1st Martingale, 2=2nd Martingale (total 3 trades max).
 
 SIGNAL_TIMEZONE = pytz.timezone('America/New_York')
 LOCAL_TIMEZONE = pytz.timezone('Africa/Windhoek')

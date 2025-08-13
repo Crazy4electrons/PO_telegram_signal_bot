@@ -31,7 +31,7 @@ async def place_order():
     global client
     global order
     amount = 1
-    symbol = "EURUSD_otc"
+    symbol = "USD/CNH"
     direction = OrderDirection.PUT
     order = await client.place_order(asset=symbol, amount=amount, direction=direction, duration=60)
     print(f"Order placed successfully: {order}")
