@@ -5,3 +5,5 @@ __pycache__
 ssid.txt
 .vscode
 .conda
+.venv
+__pycache__

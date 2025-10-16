@@ -21,7 +21,7 @@ load_dotenv()
 
 # --- MANUAL EDGE DRIVER PATH ---
 # This path must point to your msedgedriver.exe
-MANUAL_EDGEDRIVER_PATH = r"C:\\Users\\swart\\Desktop\\_\\Projects\\trader_bot\\letGo\\drivers\\msedgedriver.exe"
+MANUAL_EDGEDRIVER_PATH = r"C:\\Users\\THE-CNC-MACHINE\\Documents\\Projects\\trader_bot\\letGo\\drivers\\msedgedriver.exe"
 # -------------------------------
 
 # Configure logging for this script.
@@ -86,7 +86,7 @@ def get_pocketoption_session_data(email: str, password: str, account_type: str) 
     edge_options.set_capability("ms:loggingPrefs", {"performance": "ALL"})
 
     driver = None
-    session_data = {"ssid": None, "uid": None}
+    session_data = {"ssid": str(None), "uid": None}
 
     try:
         service = Service(MANUAL_EDGEDRIVER_PATH)

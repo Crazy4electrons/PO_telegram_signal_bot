@@ -1,0 +1,20 @@
+[project]
+name = "letgo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiohappyeyeballs==2.6.1",
+    "aiohttp==3.12.14",
+    "fastapi==0.116.1",
+    "loguru==0.7.3",
+    "pocketoptionapi-async>=2.0.0",
+    "python-dotenv==1.1.1",
+    "pytz==2025.2",
+    "requests>=2.32.5",
+    "selenium==4.34.2",
+    "uvicorn==0.35.0",
+    "webdriver-manager==4.0.2",
+    "websockets==11.0",
+]

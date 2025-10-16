@@ -14,7 +14,7 @@ $env:SSID_REFRESH_INTERVAL_MINUTES = "30" # Optional: Set refresh interval (defa
 
 # Run the Python scraper script
 # You might need to specify the full path to your python executable if it's not in your PATH
-python scraper.py
+uv run scraper.py
 
 # Optional: Clear environment variables after the script finishes (or after closing the terminal)
 # Remove-Item Env:\PO_EMAIL
