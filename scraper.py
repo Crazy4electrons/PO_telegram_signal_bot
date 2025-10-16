@@ -21,7 +21,7 @@ load_dotenv()
 
 # --- MANUAL EDGE DRIVER PATH ---
 # This path must point to your msedgedriver.exe
-MANUAL_EDGEDRIVER_PATH = r"C:\\Users\\THE-CNC-MACHINE\\Documents\\Projects\\trader_bot\\letGo\\drivers\\msedgedriver.exe"
+MANUAL_EDGEDRIVER_PATH = r"C:\\Users\\swart\\Desktop\\_\\Projects\\trader_bot\\letGo\\drivers\\msedgedriver.exe"
 # -------------------------------
 
 # Configure logging for this script.
@@ -151,7 +151,7 @@ def get_pocketoption_session_data(email: str, password: str, account_type: str) 
         logger.info("Successfully navigated to the target cabinet page.")
 
         # Give the page some time to load all WebSocket connections and messages.
-        time.sleep(10) # Increased sleep to ensure more logs are captured
+        time.sleep(20) # Increased sleep to ensure more logs are captured
 
         performance_logs = cast(List[Dict[str, Any]], driver.get_log("performance"))
         logger.info(f"Collected {len(performance_logs)} performance log entries. Analyzing for SSID and UID...")
@@ -230,7 +230,7 @@ def get_pocketoption_session_data(email: str, password: str, account_type: str) 
 if __name__ == "__main__":
     email = os.getenv('PO_EMAIL')
     password = os.getenv('PO_PASSWORD')
-    refresh_interval_minutes = int(os.getenv('SSID_REFRESH_INTERVAL_MINUTES', 30))
+    refresh_interval_minutes = int(os.getenv('SSID_REFRESH_INTERVAL_MINUTES',2*60))
     refresh_interval_seconds = refresh_interval_minutes * 60
 
     if not email or not password:

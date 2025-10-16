@@ -6,7 +6,7 @@ $poPassword = "9eE121n3"   # <--- REPLACE THIS
 # Set environment variables for the current PowerShell session
 $env:PO_EMAIL = $poEmail
 $env:PO_PASSWORD = $poPassword
-$env:SSID_REFRESH_INTERVAL_MINUTES = "30" # Optional: Set refresh interval (default 30 mins)
+$env:SSID_REFRESH_INTERVAL_MINUTES = "18000" # Optional: Set refresh interval (default 30 mins)
 
 # Navigate to the directory where your Python scripts are located
 # Adjust this path if your scripts are not in the same directory as this .ps1 file
