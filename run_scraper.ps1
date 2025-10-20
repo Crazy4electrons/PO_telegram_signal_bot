@@ -1,12 +1,12 @@
 # --- REPLACE THESE PLACEHOLDERS WITH YOUR ACTUAL POCKET OPTION CREDENTIALS ---
-$poEmail = "swartzelzantiaan@gmail.com"         # <--- REPLACE THIS
-$poPassword = "9eE121n3"   # <--- REPLACE THIS
+$poEmail = "got1joke@gmail.com"         # <--- REPLACE THIS
+$poPassword = "0nly!P@5s@PO"   # <--- REPLACE THIS
 # -----------------------------------------------------------------------------
 
 # Set environment variables for the current PowerShell session
 $env:PO_EMAIL = $poEmail
 $env:PO_PASSWORD = $poPassword
-$env:SSID_REFRESH_INTERVAL_MINUTES = "18000" # Optional: Set refresh interval (default 30 mins)
+$env:SSID_REFRESH_INTERVAL_MINUTES = "86400" # Optional: Set refresh interval (default 30 mins)
 
 # Navigate to the directory where your Python scripts are located
 # Adjust this path if your scripts are not in the same directory as this .ps1 file
