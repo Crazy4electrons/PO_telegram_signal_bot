@@ -7,7 +7,7 @@ from click import option
 import pytz
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import JSONResponse
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional, AsyncIterator, Any
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -44,9 +44,8 @@ trade_sequence_state = {
     "current_amount": INITIAL_TRADE_AMOUNT,
     "last_trade_id": None,
     "last_trade_status": None, # "win", "loss", "tie", "pending"
-    "last_trade_open_price": None, # Price at which the *current* trade in sequence opened
-    "last_trade_open_time": None, # Time at which the *current* trade in sequence opened
-    "current_balance": float('nan')
+    "profit": None, 
+    "current_balance": None # Updated before each trade
 }
 
 @asynccontextmanager
@@ -83,9 +82,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     try:
         await pocket_option_client.connect()
-        logger.info("Pocket Option client connected successfully on startup.")
-        
         balance = await pocket_option_client.get_balance()
+        logger.info("Pocket Option client connected successfully on startup.")
         logger.info(f'Startup Balance: {balance.balance} {balance.currency} (Is Demo: {balance.is_demo})')
 
     except Exception as e:
@@ -123,7 +121,8 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
         else:
             logger.critical("Failed to re-establish Pocket Option connection. Aborting trade signal processing.")
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Pocket Option API not connected and reconnection failed.")
-
+        
+    # --- Parse incoming notification ---
     raw_notification_text = (await request.body()).decode('utf-8')
     logger.info(f"Received raw notification from Macrodroid:\n{raw_notification_text}")
 
@@ -145,13 +144,18 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid trade direction.")
 
     current_local_dt = datetime.now(LOCAL_TIMEZONE)
-    
+        
     try:
         signal_time_obj = datetime.strptime(signal_entry_time_str, "%H:%M").time()
         signal_dt_in_signal_tz = SIGNAL_TIMEZONE.localize(
             datetime(current_local_dt.year, current_local_dt.month, current_local_dt.day,
-                     signal_time_obj.hour, signal_time_obj.minute, 0)
+                 signal_time_obj.hour, signal_time_obj.minute, 0)
         )
+        
+        # Check if local time is before 6 AM
+        if current_local_dt.hour <= 6:
+            signal_dt_in_signal_tz = signal_dt_in_signal_tz - timedelta(days=1)
+            
         target_local_dt = signal_dt_in_signal_tz.astimezone(LOCAL_TIMEZONE)
     except Exception as e:
         logger.error(f"Error parsing or converting signal entry time '{signal_entry_time_str}': {e}", exc_info=True)
@@ -166,24 +170,12 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
                        f"Skipping trade.")
         return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "skipped", "message": "Signal arrived too late, trade skipped."})
 
-    time_to_wait_seconds = (target_local_dt - current_local_dt).total_seconds()
+    time_to_wait_seconds = (target_local_dt - datetime.now(LOCAL_TIMEZONE)).total_seconds()
 
     logger.info(f"New signal received. Initiating a new trade sequence for {signal_asset} {signal_direction.value}. Initial Amount: ${INITIAL_TRADE_AMOUNT:.2f}")
     
     # Set the global flag to indicate a sequence is active
     is_processing_trade_sequence = True
-    trade_sequence_state.update({
-        "active": True, # This "active" in state is for internal Martingale logic within the sequence
-        "asset": signal_asset,
-        "direction": signal_direction,
-        "current_level": 0,
-        "current_amount": INITIAL_TRADE_AMOUNT,
-        "last_trade_id": None,
-        "last_trade_status": "pending",
-        "last_trade_open_price": None,
-        "last_trade_open_time": None,
-        "current_balance": pocket_option_client.get_balance() # type: ignore
-    })
 
     if time_to_wait_seconds > 0:
         logger.info(f"Waiting {time_to_wait_seconds:.2f} seconds until target entry time: {target_local_dt.strftime('%H:%M:%S')}")
@@ -198,6 +190,18 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
     except Exception as e:
         logger.warning(f"Could not retrieve balance before initial trade: {e}")
 
+    trade_sequence_state.update({
+        "active": True, # This "active" in state is for internal Martingale logic within the sequence
+        "asset": signal_asset,
+        "direction": signal_direction,
+        "current_level": 0,
+        "current_amount": INITIAL_TRADE_AMOUNT,
+        "last_trade_id": None,
+        "last_trade_status": "pending",
+        "last_trade_open_time": None,
+        "current_balance":None # type: ignore
+    })
+
     try:
         order = await pocket_option_client.place_order( # type: ignore
             asset=trade_sequence_state["asset"],
@@ -207,6 +211,7 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
         )
         logger.info(f"line 206: Initial trade placed successfully! Order ID: {order.order_id}, Status: {order.status}")
         trade_sequence_state["last_trade_id"] = order.order_id
+        
         
         # Immediately try to get the open price/time for this trade
         # This is crucial for the candle-based Martingale decision
@@ -222,7 +227,7 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
                     break
             except Exception as e:
                 logger.warning(f"Could not get initial trade details (attempt {i+1}/3): {e}")
-            await asyncio.sleep(1) # Small delay before retry
+            await asyncio.sleep(0.05) # Small delay before retry
 
         if not trade_sequence_state["last_trade_open_price"]:
             logger.error(f"Failed to obtain open price for initial trade ID {order.amount}. This will affect Martingale decisions based on candles.")
@@ -230,7 +235,10 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
             # For now, we'll proceed, but it's a critical warning.
 
         logger.info(f"Trade placed. Now initiating outcome monitoring for trade ID: {trade_sequence_state['last_trade_id']}")
-        trade_sequence_state["current_balance"] = pocket_option_client.get_balance() # type: ignore
+        current_balance = await pocket_option_client.get_balance() # type: ignore
+        print(current_balance)
+        trade_sequence_state["current_balance"]= current_balance.balance
+        logger.info(f"Current balance after placing initial trade for trade sequence: {trade_sequence_state['current_balance']}")
         asyncio.create_task(
             handle_trade_outcome_and_martingale(
                 trade_sequence_state["last_trade_id"],
@@ -238,8 +246,8 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
                 trade_sequence_state["asset"],
                 trade_sequence_state["direction"],
                 trade_sequence_state["current_amount"],
-                trade_sequence_state["last_trade_open_price"], # Pass the open price for decision making
-                trade_sequence_state["current_balance"]
+                trade_sequence_state["current_balance"],
+                target_local_dt
             )
         )
         return JSONResponse(status_code=status.HTTP_200_OK, content={
@@ -249,7 +257,9 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
             "asset": trade_sequence_state["asset"],
             "direction": trade_sequence_state["direction"].value,
             "amount": trade_sequence_state["current_amount"],
-            "martingale_level": trade_sequence_state["current_level"] # 0 for initial
+            "martingale_level": trade_sequence_state["current_level"], # 0 for initial
+            "current_balance":trade_sequence_state["current_balance"],
+            "last_trade_status":trade_sequence_state["last_trade_status"]
         })
     except Exception as e:
         logger.error(f"Failed to place initial trade: {e}", exc_info=True)
@@ -259,6 +269,7 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
         trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
         trade_sequence_state["last_trade_open_price"] = None
         trade_sequence_state["last_trade_open_time"] = None
+        trade_sequence_state["last_trade_status"] = None
         is_processing_trade_sequence = False # Release the lock
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to place initial trade: {e}")
 
@@ -297,59 +308,40 @@ async def connect_pocket_option_client() -> bool:
         return False
 
 
-async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, asset: str, direction: OrderDirection, amount: float, trade_open_price: Optional[float],current_balance:Optional[float]) -> None:
+
+async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, asset: str, direction: OrderDirection, amount: float,after_entry_balance:float,entry_time:datetime) -> None:
+    
     global trade_sequence_state, pocket_option_client, is_processing_trade_sequence
     logger.info(f"Monitoring trade ID: {trade_id} (Asset: {asset}, Direction: {direction.value}, Amount: ${amount:.2f}). Preparing for candle-based Martingale decision...")
     
     # Calculate time to wait until 5 seconds before trade ends
-    time_to_candle_check = max(0, duration - 5)
-    if time_to_candle_check > 0:
-        logger.info(f"Waiting {time_to_candle_check:.2f} seconds before checking candle for Martingale decision for trade ID {trade_id}.")
-        await asyncio.sleep(time_to_candle_check)
+    # time_to_wait_seconds = (target_local_dt - datetime.now(LOCAL_TIMEZONE)).total_seconds()
+    trade_end_time = (((entry_time+timedelta(seconds=duration))-(datetime.now(LOCAL_TIMEZONE))) + timedelta(seconds=0.05)).total_seconds()
+    logger.info(f"Trade ID {trade_id} will end in approximately {trade_end_time:.2f} seconds.")
+    if trade_end_time > 0:
+        logger.info(f"Waiting {trade_end_time:.2f} seconds before checking candle for Martingale decision for trade ID {trade_id}.")
+        await asyncio.sleep(trade_end_time)
     
     # --- Martingale Decision based on Candle ---
     martingale_reentry_needed = False
-    
-    if trade_open_price is None :
-        logger.error(f"Cannot perform candle-based Martingale decision for trade ID {trade_id}: Trade open price is missing.")
-        # Default to old behavior or assume loss for safety if open price is vital
-        # For now, we'll proceed to get official outcome and reset.
-    elif not pocket_option_client or not pocket_option_client.is_connected:
-        logger.warning(f"Pocket Option client not connected for candle check of trade ID {trade_id}. Cannot perform candle-based Martingale decision. Assuming reset.")
-        martingale_reentry_needed = False # Assume loss if we can't get candles
-    else:
-        
-        
-        try:
-            # Fetch balance to determine if Martingale is feasible
-            logger.info(f"Fetching balance for Martingale decision for trade ID {trade_id}...")
-            balance = await pocket_option_client.get_balance()
-            logger.info(f"Current Balance before Martingale decision: {balance.balance} {balance.currency}")
-            # Fetch the latest 1-minute candle
-            # candles = await pocket_option_client.get_candles(asset, 60, count=1)
-            # if candles:
-            #     latest_candle: Candle = candles[0]
-            #     logger.info(f"Latest candle for {asset} (5s before trade end): Open={latest_candle.open}, Close={latest_candle.close}, High={latest_candle.high}, Low={latest_candle.low}")
-
-            #     # Determine predicted outcome based on candle close vs. trade open price
-            #     if direction == OrderDirection.CALL:
-            #         if latest_candle.close < trade_open_price:
-            #             martingale_reentry_needed = True
-            #             logger.info(f"Predicted LOSS for CALL trade ID {trade_id}: Candle close ({latest_candle.close}) < Open price ({trade_open_price})")
-            #     elif direction == OrderDirection.PUT:
-            #         if latest_candle.close > trade_open_price:
-            #             martingale_reentry_needed = True
-            #             logger.info(f"Predicted LOSS for PUT trade ID {trade_id}: Candle close ({latest_candle.close}) > Open price ({trade_open_price})")
-                
-            #     if not martingale_reentry_needed:
-            #         logger.info(f"Predicted WIN/TIE for trade ID {trade_id}: Candle direction favorable.")
-            # else:
-                logger.warning(f"No candles retrieved for {asset} for trade ID {trade_id}. Cannot perform candle-based Martingale decision. Assuming loss.")
-                martingale_reentry_needed = True # Assume loss if no candle data
-        except Exception as e:
-            logger.error(f"Error fetching candles for trade ID {trade_id}: {e}. Cannot perform candle-based Martingale decision. Assuming loss.", exc_info=True)
-            martingale_reentry_needed = True # Assume loss if candle fetching fails
-
+    try:
+        for i in range(3): # Try a few times to get candle data
+            try:
+                current_balance = await pocket_option_client.get_balance() # type: ignore
+                if current_balance.balance is not None:
+                    break
+            except Exception as e:
+                logger.warning(f"Could not retrieve balance before Martingale decision (attempt {i+1}/3): {e}")
+                await asyncio.sleep(0.05) # Small delay before retry
+        if current_balance.balance > after_entry_balance:
+            logger.info(f"Balance check before Martingale decision: \nCurrent balance {current_balance.balance} {current_balance.currency} is more than balance after entry {after_entry_balance}. No Martingale needed.")
+            martingale_reentry_needed = False
+        else:
+            logger.info(f"determine loss based on non-increased balance: Current balance {current_balance.balance} {current_balance.currency} is less or equal to the balance after entry {after_entry_balance}. Considering Martingale re-entry.")
+            martingale_reentry_needed = True
+    except Exception as e:
+        logger.warning(f"Could not retrieve balance before Martingale decision: {e}. Aborting re-entry decision.")
+        martingale_reentry_needed = False
     # Wait for the remaining 5 seconds until trade officially ends
     # logger.info(f"Waiting for remaining 5 seconds before potential Martingale re-entry for trade ID {trade_id}.")
     # await asyncio.sleep(5) 
@@ -362,13 +354,6 @@ async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, 
             trade_sequence_state["current_amount"] *= MARTINGALE_MULTIPLIER
             
             logger.info(f"Proceeding with Martingale Level {trade_sequence_state['current_level']} for {asset} {direction.value}. New Amount: ${trade_sequence_state['current_amount']:.2f}")
-
-            try:
-                
-                logger.info(f"Balance BEFORE Martingale Level {trade_sequence_state['current_level']} trade: {balance_before_martingale.balance} {balance_before_martingale.currency}")
-            except Exception as e:
-                logger.warning(f"Could not retrieve balance before Martingale trade: {e}")
-
             try:
                 next_order = await pocket_option_client.place_order( # type: ignore
                     asset=trade_sequence_state["asset"],
@@ -376,6 +361,7 @@ async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, 
                     direction=trade_sequence_state["direction"],
                     duration=duration
                 )
+                entry_time = datetime.now(LOCAL_TIMEZONE)
                 logger.info(f"Martingale Level {trade_sequence_state['current_level']} trade placed successfully! Order ID: {next_order.order_id}, Status: {next_order.status}")
                 trade_sequence_state["last_trade_id"] = next_order.order_id
                 
@@ -385,16 +371,31 @@ async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, 
                     try:
                         martingale_order_details = await pocket_option_client.check_order_result(next_order.order_id) # type: ignore
                         if martingale_order_details and martingale_order_details.amount: # type: ignore
-                            trade_sequence_state["last_trade_open_price"] = martingale_order_details.amount # type: ignore
+                            trade_sequence_state["last_trade_open_price"] = # The above code is trying
+                            # to access the `amount`
+                            # attribute of the
+                            # `martingale_order_details`
+                            # object in Python.
+                            martingale_order_details.amount # type: ignore
                             trade_sequence_state["last_trade_open_time"] = martingale_order_details.placed_at # type: ignore
-                            logger.info(f"Martingale trade open price obtained: {martingale_order_details.ammount} at {martingale_order_details.placed_at}") # type: ignore
+                            logger.info(f"Martingale trade open price obtained: {martingale_order_details.amount} at {martingale_order_details.placed_at}") # type: ignore
                             break
                     except Exception as e:
                         logger.warning(f"Could not get Martingale trade details (attempt {i+1}/3): {e}")
-                    await asyncio.sleep(1) # Small delay before retry
-
-                if not trade_sequence_state["last_trade_open_price"]:
-                    logger.error(f"Failed to obtain open price for Martingale trade ID {next_order.order_id}. This will affect subsequent Martingale decisions.")
+                    await asyncio.sleep(0.05) # Small delay before retry
+                logger.info(f"Martingale trade placed. Now monitoring outcome for trade ID: {trade_sequence_state['last_trade_id']}")
+                
+            
+                for i in range(3): # Try a few times to get candle data
+                    try:
+                        current_balance = await pocket_option_client.get_balance() # type: ignore
+                        if current_balance.balance is not None:
+                            logger.info(f"Retrieved current balance after placing Martingale trade: {current_balance.balance} {current_balance.currency}")
+                            trade_sequence_state["current_balance"]= current_balance.balance
+                            break
+                    except Exception as e:
+                        await asyncio.sleep(0.05) # Small delay before retry
+                        logger.warning(f"Could not retrieve balance after placing Martingale trade: {e} -->this affects next Martingale decision",exc_info=True)                    
 
                 # Continue monitoring this new Martingale trade
                 asyncio.create_task(
@@ -404,7 +405,8 @@ async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, 
                         trade_sequence_state["asset"],
                         trade_sequence_state["direction"],
                         trade_sequence_state["current_amount"],
-                        trade_sequence_state["last_trade_open_price"] # Pass the new open price
+                        trade_sequence_state["current_balance"],
+                        entry_time
                     )
                 )
             except Exception as e:
@@ -415,7 +417,6 @@ async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, 
                 trade_sequence_state["current_level"] = 0
                 trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
                 trade_sequence_state["last_trade_open_price"] = None
-                trade_sequence_state["last_trade_open_time"] = None
                 is_processing_trade_sequence = False # Release the lock
         else:
             logger.info(f"Trade LOSS for {asset} {direction.value} ${amount} at final Martingale level ({MAX_MARTINGALE_LEVELS}). Resetting sequence. Waiting for next signal.")
@@ -424,7 +425,7 @@ async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, 
             trade_sequence_state["current_level"] = 0
             trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
             trade_sequence_state["last_trade_open_price"] = None
-            trade_sequence_state["last_trade_open_time"] = None
+            trade_sequence_state["last_trade_status"] = "Loss"
             is_processing_trade_sequence = False # Release the lock
     else: # predicted WIN or TIE
         logger.info(f"Predicted WIN/TIE for Trade ID {trade_id}. Resetting Martingale sequence. No re-entry.")
@@ -433,30 +434,30 @@ async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, 
         trade_sequence_state["current_level"] = 0
         trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
         trade_sequence_state["last_trade_open_price"] = None
-        trade_sequence_state["last_trade_open_time"] = None
+
+        trade_sequence_state["last_trade_status"] = "win\\tie"
         is_processing_trade_sequence = False # Release the lock
     
     # --- Final Official Outcome Check for Logging (optional, not for Martingale decision) ---
     # We still check the official outcome for logging purposes, but the Martingale decision is already made.
-    final_official_outcome = "unknown"
-    final_trade_details: Optional[OrderResult] = None
     
     # Give it a small buffer after the trade is supposed to end for the official result to settle
-    await asyncio.sleep(0.5) 
-    logger.info(f"\n\n Checking official final outcome for Trade placed at {trade_sequence_state['last_trade_open_time']}\n amount: {trade_sequence_state['current_amount']}\n asset: {asset}\n direction: {direction.value}\n\n")
+    await asyncio.sleep(0.05) 
+    logger.info(f"\n\n Checking official final outcome for Trade placed at {trade_sequence_state["last_trade_open_time"]}\n amount: {trade_sequence_state['current_amount']}\n asset: {asset}\n direction: {direction.value}\n\n")
     if pocket_option_client and pocket_option_client.is_connected:
         try:
-            final_trade_details = await pocket_option_client.check_order_result(str(trade_id))
-            if final_trade_details and final_trade_details.status in ["win", "lose", "tie"]:
-                final_official_outcome = final_trade_details.status
-                logger.info(f"OFFICIAL FINAL OUTCOME for Trade ID {trade_id}: {final_official_outcome.upper()} (Profit: {final_trade_details.profit}).")
+            if trade_sequence_state["last_trade_status"] == "win\\tie":
+                profit = (await pocket_option_client.get_balance()).balance - after_entry_balance
+                logger.info(f"\n\nOFFICIAL FINAL OUTCOME for Trade ID {trade_id}: \n win\\loss:{trade_sequence_state["last_trade_status"].upper()} \nProfit: {profit:2f}) USD.\n\n")
             else:
-                logger.warning(f"Could not retrieve definitive official outcome for trade ID {trade_id}. Status: {final_trade_details.status if final_trade_details else 'None'}")
+                logger.info(f"OFFICIAL FINAL OUTCOME for Trade ID {trade_id}: {trade_sequence_state['last_trade_status'].upper()}.")
+            trade_sequence_state["last_trade_open_time"] = None
         except Exception as e:
             logger.warning(f"Error checking official final trade result for ID {trade_id}: {e}")
     else:
         logger.warning(f"Pocket Option client not connected for official outcome check of trade ID {trade_id}.")
 
-    trade_sequence_state["last_trade_status"] = final_official_outcome # Update state with actual outcome
+    trade_sequence_state["last_trade_status"] = None # Update state with actual outcome
 
     logger.info(f"Martingale Sequence State AFTER processing Trade ID {trade_id}: Active={trade_sequence_state['active']}, Level={trade_sequence_state['current_level']}, Amount={trade_sequence_state['current_amount']:.2f}, Global Processing Lock: {is_processing_trade_sequence}")
+    
