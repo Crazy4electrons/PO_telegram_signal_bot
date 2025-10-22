@@ -1,3 +1,4 @@
+from math import log
 import os
 import json
 import time
@@ -79,16 +80,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
         return
     pocket_option_client = AsyncPocketOptionClient(ssid, is_demo=is_demo_session,enable_logging=False)
-
-    try:
-        await pocket_option_client.connect()
-        balance = await pocket_option_client.get_balance()
-        logger.info("Pocket Option client connected successfully on startup.")
-        logger.info(f'Startup Balance: {balance.balance} {balance.currency} (Is Demo: {balance.is_demo})')
-
-    except Exception as e:
-        logger.error(f"Initial Pocket Option client connection failed on startup: {e}", exc_info=True)
-        pocket_option_client = None
+    for i in range(3):
+        try:
+            await pocket_option_client.connect()
+            balance = await pocket_option_client.get_balance()
+            logger.info(f'Pocket Option client connected successfully on startup. Balance: {balance.balance} {balance.currency} (Is Demo: {balance.is_demo})')
+            break
+        except Exception as e:
+            logger.error("Failed to connect Pocket Option client.")
+            if i == 2:
+                logger.critical(f"Initial Pocket Option client connection failed on startup: {e}", exc_info=True)
+                raise e
+            logger.info("Retrying Pocket Option connection in 5 seconds...")
+            await asyncio.sleep(5)
     
     yield
 
@@ -102,7 +106,8 @@ app = FastAPI(lifespan=lifespan)
 @app.post('/trade_signal')
 async def trade_signal_webhook(request: Request) -> JSONResponse:
     global trade_sequence_state, pocket_option_client, is_demo_session, is_processing_trade_sequence
-
+    stats = pocket_option_client.get_connection_stats() # type: ignore
+    logger.info(f"Pocket Option connection stats: {stats}")
     # --- Ensure only one trade sequence is active at a time ---
     if is_processing_trade_sequence:
         logger.warning(f"Received new signal while a trade sequence is already active "
@@ -162,6 +167,7 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid signal entry time format: {e}")
 
     logger.info(f"Signal entry time (GMT-4): {signal_entry_time_str}. Calculated local target entry time: {target_local_dt.strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
+
 
     # Allow a small buffer for late signals, e.g., up to 5 seconds past target entry time.
     if current_local_dt > target_local_dt + timedelta(seconds=5):
@@ -297,7 +303,7 @@ async def connect_pocket_option_client() -> bool:
 
     try:
         if not pocket_option_client:
-            pocket_option_client = AsyncPocketOptionClient(ssid, is_demo=is_demo_session)
+            pocket_option_client = AsyncPocketOptionClient(ssid, is_demo=is_demo_session,enable_logging=False)
             
         await pocket_option_client.connect()
         logger.info("Pocket Option client re-connected successfully.")
@@ -328,8 +334,9 @@ async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, 
         for i in range(3): # Try a few times to get candle data
             try:
                 current_balance = await pocket_option_client.get_balance() # type: ignore
-                if current_balance.balance is not None:
-                    break
+                if current_balance.balance is not None and current_balance.balance > 0:
+                    if i == 3  or current_balance.balance != after_entry_balance:
+                        break
             except Exception as e:
                 logger.warning(f"Could not retrieve balance before Martingale decision (attempt {i+1}/3): {e}")
                 await asyncio.sleep(0.05) # Small delay before retry
@@ -371,12 +378,7 @@ async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, 
                     try:
                         martingale_order_details = await pocket_option_client.check_order_result(next_order.order_id) # type: ignore
                         if martingale_order_details and martingale_order_details.amount: # type: ignore
-                            trade_sequence_state["last_trade_open_price"] = # The above code is trying
-                            # to access the `amount`
-                            # attribute of the
-                            # `martingale_order_details`
-                            # object in Python.
-                            martingale_order_details.amount # type: ignore
+                            trade_sequence_state["last_trade_open_price"] = martingale_order_details.amount
                             trade_sequence_state["last_trade_open_time"] = martingale_order_details.placed_at # type: ignore
                             logger.info(f"Martingale trade open price obtained: {martingale_order_details.amount} at {martingale_order_details.placed_at}") # type: ignore
                             break
@@ -389,7 +391,7 @@ async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, 
                 for i in range(3): # Try a few times to get candle data
                     try:
                         current_balance = await pocket_option_client.get_balance() # type: ignore
-                        if current_balance.balance is not None:
+                        if current_balance.balance is not None and current_balance.balance > 0:
                             logger.info(f"Retrieved current balance after placing Martingale trade: {current_balance.balance} {current_balance.currency}")
                             trade_sequence_state["current_balance"]= current_balance.balance
                             break
