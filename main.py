@@ -4,7 +4,6 @@ import json
 import time
 import asyncio
 import logging
-from click import option
 import pytz
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import JSONResponse
@@ -18,6 +17,7 @@ from pocketoptionapi_async.models import OrderResult, Candle # Import Candle mod
 
 # Assuming parse_data.py is correctly implemented and available
 from parse_data import parse_macrodroid_trade_data
+from measure_latency import measure_one
 
 load_dotenv()
 
@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 pocket_option_client: Optional[AsyncPocketOptionClient] = None
-is_demo_session: Optional[bool] = None
+is_demo_session: Optional[bool] = os.getenv('ACCOUNT_TYPE', 'DEMO').upper() == 'DEMO'  # Default to DEMO if not set
 # A flag to ensure only one trade sequence (Martingale included) is active globally
 is_processing_trade_sequence: bool = False
 
@@ -56,13 +56,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("FastAPI lifespan startup event: Initializing Pocket Option client.")
 
     while True:
-        user_choice = input("Enter account type to use for trading (DEMO/REAL): ").strip().upper()
-        if user_choice == "DEMO":
-            is_demo_session = True
+        # user_choice = input("Enter account type to use for trading (DEMO/REAL): ").strip().upper()
+        # if user_choice == "DEMO":
+        if is_demo_session:
+            # is_demo_session = True
             logger.info("Selected DEMO account for trading session.")
             break
-        elif user_choice == "REAL":
-            is_demo_session = False
+        # elif user_choice == "REAL":
+        elif not is_demo_session:
+            # is_demo_session = False
             logger.info("Selected REAL account for trading session.")
             break
         else:
@@ -79,8 +81,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.critical("UID not found in .env. Please ensure scraper.py has run or .env is correctly set.")
         yield
         return
-    pocket_option_client = AsyncPocketOptionClient(ssid, is_demo=is_demo_session,enable_logging=False)
-    for i in range(3):
+    
+    pocket_option_client = AsyncPocketOptionClient(ssid, is_demo=is_demo_session,enable_logging=False) # type: ignore
+    for i in range(10):
         try:
             await pocket_option_client.connect()
             balance = await pocket_option_client.get_balance()
@@ -88,10 +91,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             break
         except Exception as e:
             logger.error("Failed to connect Pocket Option client.")
-            if i == 2:
+            if i == 10:
                 logger.critical(f"Initial Pocket Option client connection failed on startup: {e}", exc_info=True)
-                raise e
-            logger.info("Retrying Pocket Option connection in 5 seconds...")
+                yield 
+                return
+            logger.info(f"Retrying Pocket Option connection in 5 seconds..              retry attempt: {str(i + 1) } /10.")
             await asyncio.sleep(5)
     
     yield
@@ -167,16 +171,25 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid signal entry time format: {e}")
 
     logger.info(f"Signal entry time (GMT-4): {signal_entry_time_str}. Calculated local target entry time: {target_local_dt.strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
-
-
     # Allow a small buffer for late signals, e.g., up to 5 seconds past target entry time.
     if current_local_dt > target_local_dt + timedelta(seconds=5):
         logger.warning(f"Signal for {signal_asset} {signal_direction.value} (Entry: {signal_entry_time_str}) arrived late. "
                        f"Current local time: {current_local_dt.strftime('%H:%M:%S')}, Target local time: {target_local_dt.strftime('%H:%M:%S')}. "
                        f"Skipping trade.")
         return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "skipped", "message": "Signal arrived too late, trade skipped."})
-
-    time_to_wait_seconds = (target_local_dt - datetime.now(LOCAL_TIMEZONE)).total_seconds()
+    latency_mean = float(0)
+    latency_sum = float(0)
+    for _ in range(10):
+        print(f"== api-eu.po.market ==")
+        res = measure_one("demo-api-eu.po.market")
+        dns = res.get("dns_ms")
+        print(f"  DNS: {dns:.1f} ms")
+        latency_sum += float(dns) #type: ignore
+        if _ < 10:
+            latency_mean = latency_sum / (_ + 1)
+        await asyncio.sleep(1)
+    
+    time_to_wait_seconds = (target_local_dt - (datetime.now(LOCAL_TIMEZONE)- timedelta(milliseconds=latency_mean))).total_seconds()
 
     logger.info(f"New signal received. Initiating a new trade sequence for {signal_asset} {signal_direction.value}. Initial Amount: ${INITIAL_TRADE_AMOUNT:.2f}")
     
@@ -215,9 +228,13 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
             direction=trade_sequence_state["direction"],
             duration=trade_duration
         )
+        entry_time = datetime.now(LOCAL_TIMEZONE)
+        
+        latency =   measure_one(" demo-api-eu.po.market")
+        logger.info(f"latency: {latency}")
+        # entry_time = datetime.now(LOCAL_TIMEZONE) + timedelta(milliseconds=float(latency["dns_ms"] if latency and "dns_ms" in latency else 0))
         logger.info(f"line 206: Initial trade placed successfully! Order ID: {order.order_id}, Status: {order.status}")
         trade_sequence_state["last_trade_id"] = order.order_id
-        
         
         # Immediately try to get the open price/time for this trade
         # This is crucial for the candle-based Martingale decision
@@ -253,7 +270,7 @@ async def trade_signal_webhook(request: Request) -> JSONResponse:
                 trade_sequence_state["direction"],
                 trade_sequence_state["current_amount"],
                 trade_sequence_state["current_balance"],
-                target_local_dt
+                entry_time
             )
         )
         return JSONResponse(status_code=status.HTTP_200_OK, content={
@@ -313,7 +330,31 @@ async def connect_pocket_option_client() -> bool:
         pocket_option_client = None
         return False
 
+def save_to_env(key: str, value: str):
+    """
+    Saves or updates a key-value pair in the .env file.
+    If the key already exists, its value is updated. Otherwise, the new key-value pair is added.
+    Ensures value is enclosed in single quotes.
+    """
+    env_path = os.path.join(os.getcwd(), ".env")
+    lines = []
+    found = False
 
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            for line in f:
+                if line.strip().startswith(f"{key}="):
+                    lines.append(f"{key}='{value}'\n") # Use single quotes
+                    found = True
+                else:
+                    lines.append(line)
+
+    if not found:
+        lines.append(f"{key}='{value}'\n") # Use single quotes
+
+    with open(env_path, "w") as f:
+        f.writelines(lines)
+    logger.info(f"Successfully saved {key} to .env file.")
 
 async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, asset: str, direction: OrderDirection, amount: float,after_entry_balance:float,entry_time:datetime) -> None:
     
@@ -437,7 +478,7 @@ async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, 
         trade_sequence_state["current_amount"] = INITIAL_TRADE_AMOUNT
         trade_sequence_state["last_trade_open_price"] = None
 
-        trade_sequence_state["last_trade_status"] = "win\\tie"
+        trade_sequence_state["last_trade_status"] = "win"
         is_processing_trade_sequence = False # Release the lock
     
     # --- Final Official Outcome Check for Logging (optional, not for Martingale decision) ---
@@ -445,12 +486,22 @@ async def handle_trade_outcome_and_martingale(trade_id: int|str, duration: int, 
     
     # Give it a small buffer after the trade is supposed to end for the official result to settle
     await asyncio.sleep(0.05) 
-    logger.info(f"\n\n Checking official final outcome for Trade placed at {trade_sequence_state["last_trade_open_time"]}\n amount: {trade_sequence_state['current_amount']}\n asset: {asset}\n direction: {direction.value}\n\n")
+    try:
+        save_to_env("TRADE_SEQUENCE_STATE", json.dumps(trade_sequence_state, indent=4) + "\n",)
+        bot_settings = {"FIXED_TRADE_DURATION_SECONDS": os.getenv("FIXED_TRADE_DURATION_SECONDS", 300),
+                        "INITIAL_TRADE_AMOUNT": os.getenv("INITIAL_TRADE_AMOUNT", 1.0),
+                        "MARTINGALE_MULTIPLIER": os.getenv("MARTINGALE_MULTIPLIER", 2.0),
+                        "MAX_MARTINGALE_LEVELS": os.getenv("MAX_MARTINGALE_LEVELS", 2),
+                        }
+        save_to_env(json.dumps("BOT_SETTINGS", indent=4), json.dumps(bot_settings, indent=4) + "\n",)
+        logger.info(f"\n\n Checking official final outcome for Trade placed at {trade_sequence_state["last_trade_open_time"]}\n amount: {trade_sequence_state['current_amount']}\n asset: {asset}\n direction: {direction.value}\n\n")
+    except Exception as e:
+        logger.warning(f"Error saving trade sequence state to .env: {e}")
     if pocket_option_client and pocket_option_client.is_connected:
         try:
-            if trade_sequence_state["last_trade_status"] == "win\\tie":
+            if trade_sequence_state["last_trade_status"] == "win":
                 profit = (await pocket_option_client.get_balance()).balance - after_entry_balance
-                logger.info(f"\n\nOFFICIAL FINAL OUTCOME for Trade ID {trade_id}: \n win\\loss:{trade_sequence_state["last_trade_status"].upper()} \nProfit: {profit:2f}) USD.\n\n")
+                logger.info(f"\n\nOFFICIAL FINAL OUTCOME for Trade ID {trade_id}: \n Status:{trade_sequence_state["last_trade_status"].upper()} \nProfit: {profit:2f}) USD.\n\n")
             else:
                 logger.info(f"OFFICIAL FINAL OUTCOME for Trade ID {trade_id}: {trade_sequence_state['last_trade_status'].upper()}.")
             trade_sequence_state["last_trade_open_time"] = None

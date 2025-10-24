@@ -211,6 +211,7 @@ def get_pocketoption_session_data(email: str, password: str, account_type: str) 
             session_data["uid"] = found_uid
             save_to_env("SSID", found_full_ssid_string)
             save_to_env("UID", found_uid)
+            save_to_env("ACCOUNT_TYPE", account_type.upper())
             logger.info(f"Full SSID and UID for {account_type} account successfully extracted and saved to .env.")
         else:
             logger.warning(

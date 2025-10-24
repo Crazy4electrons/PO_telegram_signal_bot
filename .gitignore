@@ -7,3 +7,10 @@ ssid.txt
 .conda
 .venv
 __pycache__
+telegram_bot.py
+*.pyc
+.ipynb_checkpoints
+.DS_Store
+logs
+*.log
+uv.lock
